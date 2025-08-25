@@ -1,5 +1,5 @@
 # Copyright Epic Games, Inc. All Rights Reserved.
-FROM helix-and-node
+FROM node:20-bookworm
 
 # configure for Epic's p4 server
 ENV P4PORT=perforce:1666
