@@ -38,7 +38,7 @@ export class PauseState {
 
 	private _infoStr: string
 
-	private blockagePauseTimeout: NodeJS.Timer | null = null;
+	private blockagePauseTimeout: ReturnType<typeof setTimeout> | null = null;
 
 	constructor(private parentUnblock: (reason: string) => void, private readonly context: Context) {
 		this._restore()

@@ -15,8 +15,11 @@ import { EdgeIndependence } from './tests/edge-independence'
 import { EdgeInitialCl } from './tests/edge-initial-cl'
 import { ExclusiveCheckout } from './tests/exclusive-checkout'
 import { ExclusiveCheckoutUnlock } from './tests/exclusive-checkout-unlock'
+import { ExclusiveCheckoutUnlockMultiple } from './tests/exclusive-checkout-unlock-multiple'
 import { ExcludeAuthors } from './tests/exclude-authors'
 import { ExcludeAuthorsPerEdge } from './tests/exclude-authors-per-edge'
+import { ExcludeDescriptions } from './tests/exclude-descriptions'
+import { ExcludeDescriptionsPerEdge } from './tests/exclude-descriptions-per-edge'
 import { ForwardCommands, ForwardCommands2 } from './tests/forward-commands'
 import { Ignore } from './tests/ignore'
 import { ImplicitCommands } from './tests/implicit-commands'
@@ -34,11 +37,12 @@ import { RequestShelf } from './tests/request-shelf'
 import { RequestShelfIndirectTarget } from './tests/request-shelf-indirect-target'
 import { ResolveAfterSkip } from './tests/resolve-after-skip'
 import { RespectStreamPath } from './tests/respect-stream-path'
-import { SyntaxErrorOnUnknownBranch } from './tests/syntax-error-on-unknown-branch'
+import { SkipIfUnchanged } from './tests/skip-if-unchanged'
 import { StompForwardingCommands } from './tests/stomp-forwarding-commands'
 import { StompWithAdd } from './tests/stomp-with-add'
 import { StompWithBranch } from './tests/stomp-with-branch'
 import { StompWithDelete } from './tests/stomp-with-delete'
+import { SyntaxErrorOnUnknownBranch } from './tests/syntax-error-on-unknown-branch'
 import { TestChain } from './tests/test-chain'
 import { TestEdgeGate } from './tests/test-edge-gate'
 import { TestFlags } from './tests/test-flags'
@@ -219,7 +223,12 @@ async function go() {
 
 		new PostToAdditionalChannel(p4),
 		new BranchspecTest(p4),
-		new ExclusiveCheckoutUnlock(p4)
+		new ExclusiveCheckoutUnlock(p4),
+		new ExclusiveCheckoutUnlockMultiple(p4),
+		new ExcludeDescriptions(p4), // 50
+
+		new ExcludeDescriptionsPerEdge(p4),
+		new SkipIfUnchanged(p4)
 	]
 
 	const TARGET_TEST_DEFS: [string[], string | null][] = [

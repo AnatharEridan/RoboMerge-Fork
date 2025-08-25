@@ -6,7 +6,7 @@ const streams: Stream[] = [
 	{name: 'Release', streamType: 'release', parent: 'Main'}
 ]
 
-export class ExclusiveCheckout extends FunctionalTest {
+export class ExclusiveCheckoutUnlockMultiple extends FunctionalTest {
 	mainSpec: RobomergeBranchSpec
 	releaseUser2Client: P4Client
 
@@ -16,25 +16,28 @@ export class ExclusiveCheckout extends FunctionalTest {
 
 		const mainClient = this.getClient('Main', 'testuser1')
 		await P4Util.addFileAndSubmit(mainClient, 'test.uasset', 'Dummy content', true)
-		await P4Util.addFileAndSubmit(mainClient, 'test2.uasset', 'Dummy content', true)
+        await P4Util.addFileAndSubmit(mainClient, 'test2.uasset', 'Dummy content', true)
 		
 		this.releaseUser2Client = this.getClient('Release', 'testuser2')
 		await Promise.all([
 			mainClient.edit('test.uasset'),
+			mainClient.edit('test2.uasset'),
 			this.p4.populate(this.getStreamPath('Release'), 'Initial branch of files from Main')
 				.then(() => this.releaseUser2Client.sync())
 		])
 	}
 
-	run() {
+	async run() {
 		// second user commits change in Release while first user has file in main checked out
-		P4Util.editFile(this.releaseUser2Client, 'test.uasset', 'New content')
-		P4Util.editFile(this.releaseUser2Client, 'test2.uasset', 'New content')
-		return P4Util.submit(this.releaseUser2Client, "Submit by second user")
+		await P4Util.editFile(this.releaseUser2Client, 'test.uasset', 'New content')
+        await P4Util.editFile(this.releaseUser2Client, 'test2.uasset', 'New content')
+        await P4Util.submit(this.releaseUser2Client, "Files")
 	}
 
-	verify() {
-		return this.ensureBlocked('Release', 'Main')
+	async verify() {
+		await this.ensureBlocked('Release', 'Main')
+        await this.verifyAndPerformUnlock('Release', 'Main')
+        await this.ensureNotBlocked('Release', 'Main')
 	}
 
 	getBranches() {

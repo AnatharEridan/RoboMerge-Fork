@@ -379,8 +379,8 @@ class Watchdog {
 
 	private analytics: Analytics
 
-	private respawnTimer: NodeJS.Timer | null = null
-	private memUsageTimer: NodeJS.Timer
+	private respawnTimer: ReturnType<typeof setTimeout> | null = null
+	private memUsageTimer: ReturnType<typeof setTimeout>
 }
 
 const watchdog = new Watchdog

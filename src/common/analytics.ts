@@ -225,7 +225,7 @@ export class Analytics {
 
 	private perforceRetries = 0
 
-	private flushInterval: NodeJS.Timer	
+	private flushInterval: ReturnType<typeof setTimeout>	
 }
 
 export function runTests(parentLogger: ContextualLogger) {

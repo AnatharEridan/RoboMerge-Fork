@@ -4,6 +4,7 @@ import { Branch, MergeAction, MergeMode } from './branch-interfaces';
 import { BranchGraphInterface, PendingChange, Target, TargetInfo } from './branch-interfaces';
 import { BotName, Edge, GraphAPI, Node, makeTargetName } from '../new/graph';
 import { ContextualLogger } from '../common/logger';
+import { Change } from '../common/perforce';
 
 // const NEW_STUFF = false
 
@@ -264,8 +265,8 @@ export class DescriptionParser {
 		return true
 	}
 
-	parse(lines: string[]) {
-		for (const line of lines) {
+	parse(desc: string, lineEnd?: string) {
+		for (const line of desc.split(lineEnd || '\n').map(s => s.trim())) {
 			const result = tokenizeLine(line)
 			if (!result) {
 				// strip beginning blanks
@@ -333,20 +334,29 @@ export class DescriptionParser {
 			}
 		}
 	}
+
+	static async getAuthor(_change: Change, _logger: ContextualLogger) : Promise<string|undefined> {
+		return undefined
+	}
 }
 
-export function parseDescriptionLines(args: {
-		lines: string[],
+export const descriptionParsers = new Map<string, typeof DescriptionParser>()
+
+export function parseDescription(desc: string,
+	args: {
 		isDefaultBot: boolean, 
 		graphBotName: string, 
 		cl: number, 
 		aliasesUpper: string[],
 		macros: {[name: string]: string[]},
 		logger: ContextualLogger
-	}
-	) {
-	const lineParser = new DescriptionParser(args.isDefaultBot, args.graphBotName, args.cl, args.aliasesUpper, args.macros)
-	lineParser.parse(args.lines)
+		parser?: string|null,
+		lineEnd?: string
+	}) {
+
+	const descriptionParser = args.parser && descriptionParsers.get(args.parser) || DescriptionParser
+	const lineParser = new descriptionParser(args.isDefaultBot, args.graphBotName, args.cl, args.aliasesUpper, args.macros)
+	lineParser.parse(desc, args.lineEnd)
 	return lineParser
 }
 
@@ -810,7 +820,7 @@ const colors = require('colors')
 colors.enable()
 colors.setTheme(require('colors/themes/generic-logging.js'))
 
-export function runTests(parentLogger: ContextualLogger) {
+export async function runTests(parentLogger: ContextualLogger) {
 	const logger = parentLogger.createChild('Targets')
 
 	const defaultArgs = {
@@ -819,7 +829,8 @@ export function runTests(parentLogger: ContextualLogger) {
 		cl: 1,
 		aliasesUpper: [],
 		macros: {'m': ['#robomerge X, Y'], 'otherbot': ['#robomerge[A] B']},
-		logger
+		logger,
+		parser: null
 	}
 
 	let fails = 0
@@ -855,61 +866,61 @@ export function runTests(parentLogger: ContextualLogger) {
 
 	(() => {
 		testName = 'no commands'
-		const parser = parseDescriptionLines({lines: ['no command'], ...defaultArgs})
+		const parser = parseDescription('no command', defaultArgs)
 		parserAssert(parser, 1, 0, 0, 0, 0, parser.descFinal[0] === 'no command')
 	})();
 
 	(() => {
 		testName = 'multiple targets'
-		const parser = parseDescriptionLines({lines: ['#robomerge A', '#robomerge B'], ...defaultArgs})
+		const parser = parseDescription('#robomerge A\n#robomerge B', defaultArgs)
 		parserAssert(parser, 0, 2, 0, 0, 0, true)
 	})();
 
 	(() => {
 		testName = 'comma separated targets'
-		const parser = parseDescriptionLines({lines: ['#robomerge A, B'], ...defaultArgs})
+		const parser = parseDescription('#robomerge A, B', defaultArgs)
 		parserAssert(parser, 0, 2, 0, 0, 0, true)
 	})();
 
 	(() => {
 		testName = 'space separated targets'
-		const parser = parseDescriptionLines({lines: ['#robomerge A B'], ...defaultArgs})
+		const parser = parseDescription('#robomerge A B', defaultArgs)
 		parserAssert(parser, 0, 2, 0, 0, 0, true)
 	})();
 
 	(() => {
 		testName = 'macro'
-		const parser = parseDescriptionLines({lines: ['#robomerge M'], ...defaultArgs})
+		const parser = parseDescription('#robomerge M', defaultArgs)
 		parserAssert(parser, 0, 2, 0, 1, 0, true)
 	})();
 
 	(() => {
 		testName = 'other bot'
-		const parser = parseDescriptionLines({lines: ['#robomerge[B] A'], ...defaultArgs})
+		const parser = parseDescription('#robomerge[B] A', defaultArgs)
 		parserAssert(parser, 0, 0, 1, 0, 0, true)
 	})();
 
 	(() => {
 		testName = 'all bots'
-		const parser = parseDescriptionLines({lines: ['#robomerge[ALL] A'], ...defaultArgs})
+		const parser = parseDescription('#robomerge[ALL] A', defaultArgs)
 		parserAssert(parser, 0, 1, 0, 0, 0, true)
 	})();
 
 	(() => {
 		testName = 'other bot macro'
-		const parser = parseDescriptionLines({lines: ['#robomerge otherbot'], ...defaultArgs})
+		const parser = parseDescription('#robomerge otherbot', defaultArgs)
 		parserAssert(parser, 0, 0, 1, 1, 0, true)
 	})();
 
 	(() => {
 		testName = 'unknown tag'
-		const parser = parseDescriptionLines({lines: ['#unknown blah'], ...defaultArgs})
+		const parser = parseDescription('#unknown blah', defaultArgs)
 		parserAssert(parser, 1, 0, 0, 0, 0, parser.descFinal[0] === '#unknown blah')
 	})();
 
 	(() => {
 		testName = 'sanitize known tag'
-		const parser = parseDescriptionLines({lines: ['#fyi blah'], ...defaultArgs})
+		const parser = parseDescription('#fyi blah', defaultArgs)
 		assert(parser.descFinal.length === 1 &&
 			parser.descFinal[0].indexOf('#') < 0 && parser.descFinal[0].toLowerCase().indexOf('fyi') >= 0,
 			'known tag sanitized')
@@ -917,11 +928,20 @@ export function runTests(parentLogger: ContextualLogger) {
 
 	(() => {
 		testName = 'sanitize swarm tag'
-		const parser = parseDescriptionLines({lines: ['#review-123 blah'], ...defaultArgs})
+		const parser = parseDescription('#review-123 blah', defaultArgs)
 		assert(parser.descFinal.length === 1 &&
 			parser.descFinal[0].indexOf('#') < 0 && parser.descFinal[0].toLowerCase().indexOf('blah') >= 0,
 			'swarm tag sanitized')
 	})();
+
+	await import('./changelistparsers/customtestparser');
+	(() => {
+		testName = 'custom parser '
+		const parser = parseDescription('roger.rabbit\nRemaining description\nto be parsed', {...defaultArgs, parser: 'testcustomparser'})
+		assert(parser.authorTag === 'roger.rabbit', 'author parsed')
+		assert(parser.descFinal.length === 2, 'description parsed')
+	})();
+
 
 	if (fails === 0) {
 		logger.info(colors.info(`Targets tests succeeded (${assertions} assertions)`))

@@ -16,7 +16,7 @@ type Success = 'failed' | 'succeeded'
 
 // deliberately not much in here - assuming stream for the moment
 export class Node {
-	constructor(public stream: Stream) // of form //x[/x]*
+	constructor(public stream: Stream, public serverID?: string) // of form //x[/x]*
 	{}
 
 	offerDebugName(name: string) {
@@ -54,7 +54,10 @@ export function makeTargetName(bot: BotName, nodeName: string) {
 
 function makeBranchId(arg: string | Branch) {
 	let depotPath: string
-	if ((arg as Branch).rootPath) {
+	if ((arg as Branch).uniqueBranch) {
+		return (arg as Branch).name as Stream
+	}
+	else if ((arg as Branch).rootPath) {
 		depotPath = (arg as Branch).rootPath.replace('/...', '')
 	}
 	else {
@@ -123,12 +126,23 @@ export class Graph {
 
 	findOrCreateStreamNode(depotPath: string | Branch) {
 		const branchId = makeBranchId(depotPath)
-		return setDefault(this.streamNodes, branchId, new Node(branchId))
+		const server = (depotPath as Branch).config?.streamServer
+		return setDefault(this.streamNodes, branchId, new Node(branchId, server))
 	}
 
-	findNodeForStream(depotPath: string | Branch) {
+	findNodeForStream(depotPath: string | Branch, allowPartialMatch?: boolean) {
 		const branchId = makeBranchId(depotPath)
-		return this.streamNodes.get(branchId)
+		let nodeForStream = this.streamNodes.get(branchId)
+		if (!nodeForStream && allowPartialMatch) {
+			const partialMatchbranchId = (branchId as string) + '/'
+			for (const [stream, node] of this.streamNodes) {
+				if (stream.startsWith(partialMatchbranchId)) {
+					nodeForStream = node
+					break
+				}
+			}
+		}
+		return nodeForStream
 	}
 
 	findNodeForBranch(branch: Branch) {
@@ -369,7 +383,6 @@ export function addBranchGraph(graph: Graph, branchGraph: BranchGraphInterface) 
 	const botname = branchGraph.botname as BotName
 	const branchNodes = new Map<Branch, Node>()
 
-	// excluding subpath bots for now
 	for (const branch of branchGraph.branches) {
 		if (!branch.bot) {
 			throw new Error(`branch ${branch.name} not running!`) // fine, but try again later
@@ -747,7 +760,7 @@ export function parseTargetsAndFlags(graph: Graph, botname: BotName, tokens: str
 // kind of odd to do this before computing implicit, but shouldn't do any harm
 	for (const auto of automaticTargets) {
 		if (!targets.has(auto)) {
-			targets.set(auto, 'normal' || forcedMode)
+			targets.set(auto, forcedMode ?? 'normal')
 		}
 	}
 
@@ -811,7 +824,7 @@ export class Trace {
 	constructor(private graph: Graph, parentLogger: ContextualLogger)
 	{
 		this.traceLogger = parentLogger.createChild('Trace')
-		this.p4 = new PerforceContext(this.traceLogger)
+		this.p4 = PerforceContext.getServerContext(this.traceLogger)
 	}
 
 	async traceRoute(cl: number, sourceNodeStr: string, targetNodeStr: string) {
@@ -832,7 +845,7 @@ export class Trace {
 
 		let change
 		try {
-			change = await this.p4.getChange(sourceNode.stream + '/...', cl)
+			change = await this.p4.getChange(cl)
 		}
 		catch (err) {
 			return 'CHANGELIST_NOT_FOUND'

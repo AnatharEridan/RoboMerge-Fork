@@ -1,5 +1,3 @@
-set -e
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NO_COLOUR='\033[0m'
@@ -34,17 +32,29 @@ cleanup() {
 
 cleanup
 
-docker network create --driver bridge robomerge_functtest_network
-
+docker network create --driver bridge robomerge_functtest_network &
 
 docker build -t helix -f helix.Dockerfile .
 docker build -t helix-and-node -f helix-and-node.Dockerfile .
 
-docker build -t p4docker -f Dockerfile.p4docker .
-docker build -t robomerge -f Dockerfile .
+docker build -t p4docker -f Dockerfile.p4docker . &
+docker build -t robomerge -f Dockerfile . &
+robo_build_pid=$!
 
-docker build -t robomerge_functionaltests -f functional_tests/tstests.Dockerfile .
+docker build -t robomerge_functionaltests -f functional_tests/tstests.Dockerfile . &
+tests_build_pid=$!
 
+wait $robo_build_pid
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+wait $tests_build_pid
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+wait
 
 echo "Running unit tests"
 docker run -a stderr -h robomerge_unittests --name robomerge_unittests robomerge npm test
@@ -83,6 +93,7 @@ docker run -d -p 8877:8877 -p 8811:8811 -p 25:25 -h robomerge_functtest --name r
     -e BOTNAME=ft1,ft2,ft3,ft4,targets  \
     -e ROBO_LOG_LEVEL=info \
     -e ROBO_SLACK_DOMAIN=http://localhost:8811 \
+    -e ROBO_EXCLUSIVE_LOCK_OPENEDS_TO_RUN=1 \
     robomerge node --trace-warnings dist/robo/watchdog.js
 
 docker run -t --hostname robomerge_functionaltests --name robomerge_functionaltests --network robomerge_functtest_network  \

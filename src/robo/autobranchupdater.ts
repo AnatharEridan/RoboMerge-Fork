@@ -6,7 +6,7 @@ import { ContextualLogger } from '../common/logger';
 import { P4_FORCE, PerforceContext, Workspace } from '../common/perforce';
 import { Bot } from './bot-interfaces';
 import { BranchDefs } from './branchdefs';
-import { GraphInterface } from './graph-interface';
+import { GraphBot } from './graphbot';
 import * as p4util from '../common/p4util';
 
 const DISABLE = false
@@ -42,14 +42,13 @@ export class AutoBranchUpdater implements Bot {
 	isRunning = false
 	isActive = false
 
-	static p4: PerforceContext
 	static config: AutoBranchUpdaterConfig
 	static initialCl: number
 
 	tickCount = 0
 
-	constructor(private graphBot: GraphInterface, parentLogger: ContextualLogger) {
-		this.p4 = AutoBranchUpdater.p4!
+	constructor(private graphBot: GraphBot, parentLogger: ContextualLogger, private readonly previewMode: boolean) {
+		this.p4 = PerforceContext.getServerContext(parentLogger)
 
 		const config = AutoBranchUpdater.config
 		this.filePath = `${config.rootPath}/${graphBot.filename}`
@@ -59,14 +58,13 @@ export class AutoBranchUpdater implements Bot {
 		this.abuLogger = parentLogger.createChild('ABU')
 	}
 
-	static async init(deps: any, config: AutoBranchUpdaterConfig, parentLogger: ContextualLogger) {
-		this.p4 = deps.p4
+	static async init(p4: PerforceContext, config: AutoBranchUpdaterConfig, parentLogger: ContextualLogger) {
 		this.config = config
 		const logger = parentLogger.createChild('ABU')
 
 		logger.info(`Finding most recent branch spec changelist from ${config.rootPath}`)
 		var bsRoot = config.rootPath + '/...'
-		const change = await this.p4.latestChange(bsRoot)
+		const change = await p4.latestChange(bsRoot)
 		if (change === null)
 			throw new Error(`Unable to query for most recent branch specs CL`)
 
@@ -85,7 +83,7 @@ export class AutoBranchUpdater implements Bot {
 		}
 
 		const opts = !config.devMode ? [P4_FORCE] : undefined 
-		await this.p4.sync(config.workspace, `${bsRoot}@${change.change}`, {opts})
+		await p4.sync(config.workspace, `${bsRoot}@${change.change}`, {opts})
 	}
 	
 	async start() {
@@ -150,12 +148,11 @@ export class AutoBranchUpdater implements Bot {
 			return
 		}
 
-		const validationErrors: string[] = []
-		const result = BranchDefs.parseAndValidate(validationErrors, branchGraphText, await this.p4.streams())
+		const result = await BranchDefs.parseAndValidate(this.abuLogger, branchGraphText)
 		if (!result.branchGraphDef) {
 			// @todo email author of changes!
 			let errText = 'failed to parse/validate branch specs file\n'
-			for (const error of validationErrors) {
+			for (const error of result.validationErrors) {
 				errText += `${error}\n`
 			}
 			this.abuLogger.error(errText.trim())
@@ -184,23 +181,7 @@ export class AutoBranchUpdater implements Bot {
 				return
 			}
 
-			for (let retryCount = 0; ; ++retryCount) {
-				try {
-					await this.updateMirror(mirrorWorkspace)
-					return
-				}
-				catch (err) {
-
-					if (retryCount < 5) {
-						this.abuLogger.warn(`Mirror file reloading error (retries ${retryCount}: ${err}`)
-						p4util.cleanWorkspaces(this.p4, [[mirrorWorkspace.name, mirrorWorkspace.depotpath]])
-					}
-					else {
-						this.abuLogger.error('Mirror file reloading failed, retries exhausted')
-						throw err
-					}
-				}
-			}
+			await this.updateMirror(mirrorWorkspace)
 		})
 	}
 
@@ -217,28 +198,53 @@ export class AutoBranchUpdater implements Bot {
 	}
 
 	private async updateMirror(workspace: MirrorPaths) {
+
+		if (this.previewMode)
+		{
+			this.abuLogger.info("Skipping mirror update in Preview Mode")
+			return
+		}
+
 		this.abuLogger.info("Updating branchmap mirror")
 
 		const stream = this.graphBot.branchGraph.config.mirrorPath[0]
 
-		const workspaceQueryResult = await this.p4.find_workspace_by_name(workspace.name)
+		// make sure the root directory exists
+		fs.mkdirSync(workspace.directory, {recursive:true})
+
+		const workspaceQueryResult = await this.p4.find_workspace_by_name(workspace.name, {includeUnloaded: true})
 		if (workspaceQueryResult.length === 0) {
 			await this.p4.newWorkspace(workspace.name, {
 				Stream: stream,
 				Root: AutoBranchUpdater.config!.workspace.directory
 			})
 		}
+		else {
+			if (workspaceQueryResult[0].IsUnloaded) {
+				await this.p4.reloadWorkspace(workspace.name)
+			}
+			await p4util.cleanWorkspace(this.abuLogger, this.p4, this.graphBot.branchGraph.botname, workspace, workspace.depotpath)
+		}
 
 		const {depotpath, realFilepath, mirrorFilepath} = workspace
 
-		await this.p4.sync(workspace, depotpath, {opts:[P4_FORCE]})
-		const cl = await this.p4.new_cl(workspace, "Updating mirror file\n#jira none\n")
-		await this.p4.edit(workspace, cl, depotpath)
-		await new Promise((done, _) => fs.copyFile(realFilepath, mirrorFilepath, done))
+		const cl = await this.p4.new_cl(workspace, "Updating mirror file\n")
+		const fstat = await this.p4.fstat(workspace, depotpath)
+		if (fstat.length > 0) {
+			await this.p4.sync(workspace, depotpath, {opts:[P4_FORCE]})
+			await this.p4.edit(workspace, cl, depotpath)
+		}
+		else {
+			fs.mkdirSync(path.dirname(mirrorFilepath), { recursive: true })
+		}
+		 fs.copyFileSync(realFilepath, mirrorFilepath)
+		if (fstat.length == 0) {
+			await this.p4.add(workspace, cl, depotpath)
+		}
 		await this.p4.submit(workspace, cl)
 	}
 
-	static getMirrorWorkspace(bot: GraphInterface): MirrorPaths | null {
+	static getMirrorWorkspace(bot: GraphBot): MirrorPaths | null {
 		const mirrorPathBits = bot.branchGraph.config.mirrorPath
 		if (mirrorPathBits.length === 0) {
 			return null
@@ -248,9 +254,13 @@ export class AutoBranchUpdater implements Bot {
 			throw new Error('If mirrorPath is specified, expecting [stream, sub-path, filename]')
 		}
 
+		if (mirrorPathBits[0].length == 0 || mirrorPathBits[2].length == 0) {
+			throw new Error('stream and filename must be supplied for mirrorPath')
+		}
+
 		const directory = AutoBranchUpdater.config!.workspace.directory
-		const depotFolder = mirrorPathBits.slice(0, 2).join('/')
-		const depotpath = mirrorPathBits.join('/')
+		const depotFolder = mirrorPathBits[1].length > 0 ? mirrorPathBits.slice(0, 2).join('/') : mirrorPathBits[0]
+		const depotpath = `${depotFolder}/${mirrorPathBits[2]}`
 		const realFilepath = path.join(directory, bot.filename)
 		const mirrorFilepath = path.join(directory, ...mirrorPathBits.slice(1))
 		return {

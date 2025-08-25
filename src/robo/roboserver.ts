@@ -71,7 +71,7 @@ let ENVIRONMENT: {[param: string]: any}
 if (ENVIRONMENT.devMode) {
 	roboserverStartupLogger.warn('Running in DEV_MODE')
 }
-if (ENVIRONMENT.previewMode) {
+if (ENVIRONMENT.previewOnly) {
 	roboserverStartupLogger.warn('Running in PREVIEW_MODE')
 }
 
@@ -137,13 +137,6 @@ export class RoboServer {
 		}
 
 		this.server.addFileMapping('/allbots', 'allbots.html')
-		this.server.addFileMapping('/js/*.wasm', 'bin/$1.wasm.gz', {
-			filetype: "application/wasm", 
-			headers: [
-				['Cache-Control', 'max-age=' + 60*60*24*7],
-				['Content-Encoding', 'gzip']
-			]
-			})
 		this.server.addFileMapping('/js/*.js', 'js/$1.js')
 		this.server.addFileMapping('/css/*.css', 'css/$1.css')
 		this.server.addFileMapping('/img/*.png', 'images/$1.png')
@@ -218,6 +211,29 @@ class RoboWebApp implements AppInterface {
 			query += "?"
 		}
 		query += `cl=${clStr}`
+
+		const template = await readUtf8File('public/trackchange.html')
+		return Mustache.render(template, {cl, query})
+	}
+
+	@SecureHandler('GET', '/trackchange/*/*', {filetype: 'text/html'}) 
+	async trackChangeOnServer(serverId: string, clStr: string) {
+		if (!this.authData) {
+			throw new Error('Secure call but no auth data?')
+		}
+
+		const cl = parseInt(clStr)
+		if (isNaN(cl)) {
+			throw new Error(`Failed to parse alleged CL '${clStr}'`)
+		}
+
+		let query = "/trackchange"
+		if (this.request.url.search.length > 0) {
+			query += `${this.request.url.search}&`
+		} else {
+			query += "?"
+		}
+		query += `cl=${clStr}&serverId=${serverId}`
 
 		const template = await readUtf8File('public/trackchange.html')
 		return Mustache.render(template, {cl, query})
@@ -328,10 +344,10 @@ class RoboWebApp implements AppInterface {
 		})
 	}
 
-	@SecureHandler('GET', '/help', {filetype: 'text/html'}) 
+	@Handler('GET', '/help', {filetype: 'text/html'}) 
 	renderHelp() { return RoboWebApp.renderMarkdownFile('README.md') }
 
-	@SecureHandler('GET', '/contact', {filetype: 'text/html'}) 
+	@Handler('GET', '/contact', {filetype: 'text/html'}) 
 	renderContactInfo() { return RoboWebApp.renderMarkdownFile('ContactInfo.md') }
 
 	@SecureHandler('GET', '/api/logs', {requiredTags: ['fte']})

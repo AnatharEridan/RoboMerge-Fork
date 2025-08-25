@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { Arg, readProcessArgs } from '../common/args';
 import { ContextualLogger } from '../common/logger';
+import { Vault } from './vault'
 
 const LdapAuth: any = require('ldapauth-fork');
 
@@ -70,19 +71,14 @@ export class Session {
 			}
 		}
 
-		try {
-			const vaultString = fs.readFileSync(Session.VAULT_PATH + '/vault.json', 'ascii')
-			const vault = JSON.parse(vaultString)
-			Session.LDAP_CONFIG.adminPassword = vault['ldap-password']
-			Session.COOKIE_KEY = vault['cookie-key']
+		const vault = new Vault(Session.VAULT_PATH, logger)
+		if (vault.valid) {
+			Session.LDAP_CONFIG.adminPassword = vault.ldapPassword
+			Session.COOKIE_KEY = vault.cookieKey
 			return
 		}
-		catch (err) {
-			const errStr = err.toString().replace(/(E|e)(R|r)(R|r)(O|o)(R|r)/,"$1$2$30$5")
-			logger.warn(`Warning (ok in dev):  ${errStr}`)
-			Session.COOKIE_KEY = DEV_COOKIE_KEY
-		}
 
+		Session.COOKIE_KEY = DEV_COOKIE_KEY
 		logger.warn('No vault or no LDAP creds in vault (this is ok for testing)')
 	}
 

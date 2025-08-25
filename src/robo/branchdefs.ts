@@ -1,12 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-import { StreamSpecs } from '../common/perforce'
-
-// for validating all branchspecs
-// import { ContextualLogger } from '../common/logger';
-// import { initializePerforce, PerforceContext, StreamSpec } from '../common/perforce';
-// import fs = require('fs')
-// import path = require('path')
+import { PerforceContext } from '../common/perforce'
+import { ContextualLogger } from '../common/logger';
 
 const jsonlint: any = require('jsonlint')
 
@@ -14,7 +9,6 @@ const RESERVED_BRANCH_NAMES = ['NONE', 'DEFAULT', 'IGNORE', 'DEADEND', ''];
 
 export interface BotConfig {
 	defaultStreamDepot: string | null
-	defaultIntegrationMethod: string | null
 	isDefaultBot: boolean
 	noStreamAliases: boolean
 	globalNotify: string[]
@@ -22,9 +16,11 @@ export interface BotConfig {
 	nagSchedule: number[] | null
 	nagAcknowledgedSchedule: number[] | null
 	nagAcknowledgedLeeway: number | null
+	changelistParser: string | null
 	triager: string | null
 	checkIntervalSecs: number
 	excludeAuthors: string[]
+	excludeDescriptions: string[]
 	emailOnBlockage: boolean
 	visibility: string[] | string
 	slackChannel: string
@@ -41,6 +37,7 @@ const branchBasePrototype = {
 	name: '',
 
 	rootPath: '',
+	uniqueBranch: false,
 	isDefaultBot: false,
 	emailOnBlockage: false, // if present, completely overrides BotConfig
 
@@ -49,6 +46,7 @@ const branchBasePrototype = {
 	forceFlowTo: [''],
 	defaultFlow: [''],
 	macros: {} as { [name: string]: string[] } | undefined,
+	changelistParser: null as string | null,
 	resolver: '' as string | null,
 	triager: '' as string | null,
 	nagWhenBlocked: false as boolean | null,
@@ -63,7 +61,7 @@ export type BranchBase = typeof branchBasePrototype
 
 export class IntegrationMethod {
 	static NORMAL = 'normal'
-	static CONVERT_TO_EDIT = 'convert-to-edit'
+	static SKIP_IF_UNCHANGED = 'skip-if-unchanged'
 
 	static all() {
 		const cls: any = IntegrationMethod
@@ -97,6 +95,7 @@ export const commonOptionFieldsPrototype = {
 	incognitoMode: false,
 
 	excludeAuthors: [] as string[], // if present, completely overrides BotConfig
+	excludeDescriptions: [] as string[], // if present, completely overrides BotConfig
 
 	// by default, specify when gate catch ups are allowed; can be inverted to disallow
 	integrationWindow: [] as IntegrationWindowPane[],
@@ -113,21 +112,19 @@ const nodeOptionFieldsPrototype = {
 	...commonOptionFieldsPrototype,
 
 	disabled: false,
-	integrationMethod: '',
 	forceAll: false,
 	visibility: '' as string[] | string,
 	blockAssetFlow: [''],
 	disallowDeadend: false,
 
+	streamServer: undefined as string | undefined,
 	streamDepot: '',
 	streamName: '',
 	streamSubpath: '',
-	workspace: '',
+	uniqueBranch: false,
 
 	graphNodeColor: '',
 
-	// if set, still generate workspace but use this name
-	workspaceNameOverride: '',
 	additionalSlackChannelForBlockages: '',
 	postMessagesToAdditionalChannelOnly: false,
 	ignoreBranchspecs: false,
@@ -157,10 +154,14 @@ const edgeOptionFieldsPrototype = {
 	nagWhenBlocked: true,
 
 	terminal: false, // changes go along terminal edges but no further
+	integrationMethod: 'normal',
 
 	implicitCommands: [''],
 
 	ignoreInCycleDetection: false,
+
+	// if set, still generate workspace but use this name
+	workspaceNameOverride: '',
 
 	approval: {
 		description: '',
@@ -198,7 +199,9 @@ export interface BranchGraphDefinition {
 // eventually, switch branch map to using a separate class defined here for the branch definitions
 
 
-function validateCommonOptions(options: Partial<CommonOptionFields>) {
+async function validateCommonOptions(logger: ContextualLogger, options: Partial<CommonOptionFields>, isPreviewing?: boolean) {
+	const errors: string[] = []
+	const warnings: string[] = []
 	if (options.integrationWindow) {
 		for (const pane of options.integrationWindow) {
 			if (pane.daysOfTheWeek) {
@@ -206,19 +209,32 @@ function validateCommonOptions(options: Partial<CommonOptionFields>) {
 					const dayStr = pane.daysOfTheWeek[index]
 					const day = dayStr.slice(0, 3).toLowerCase()
 					if (DAYS_OF_THE_WEEK.indexOf(day) < 0) {
-						throw new Error(`Unknown day of the week ${dayStr}`)
+						errors.push(`Unknown day of the week ${dayStr}`)
 					}
 					pane.daysOfTheWeek[index] = day as DayOfTheWeek
 				}
 			}
 		}
 	}
+	if (typeof(options.lastGoodCLPath) === 'string') {
+		const fstat = await PerforceContext.getServerContext(logger).fstat(null, options.lastGoodCLPath, true)
+		if (fstat.length == 0) {
+			if (isPreviewing) {
+				warnings.push(`Unable to find lastGoodCLPath ${options.lastGoodCLPath}`)
+			} else {
+				errors.push(`Unable to find lastGoodCLPath ${options.lastGoodCLPath}`)
+			}
+		}
+	}
+	return {errors, warnings}
 }
 
 
 interface ParseResult {
 	branchGraphDef: BranchGraphDefinition | null
 	config: BotConfig
+	validationErrors: string[],
+	validationWarnings: string[]
 }
 
 export type StreamResult = {
@@ -261,19 +277,19 @@ export class BranchDefs {
 		return undefined
 	}
 
-	private static checkValidIntegrationMethod(outErrors: string[], method: string, branchName: string) {
+	private static checkValidIntegrationMethod(validationErrors: string[], method: string, name: string) {
 		if (IntegrationMethod.all().indexOf(method.toLowerCase()) === -1) {
-			outErrors.push(`Unknown integrationMethod '${method}' in '${branchName}'`)
+			validationErrors.push(`Unknown integrationMethod '${method}' in '${name}'`)
 		}
 	}
 
-	static parseAndValidate(outErrors: string[], branchSpecsText: string, allStreamSpecs: StreamSpecs, isPreviewing?: boolean): ParseResult {
+	static async parseAndValidate(logger: ContextualLogger, branchSpecsText: string, isPreviewing?: boolean): Promise<ParseResult> {
 		const defaultConfigForWholeBot: BotConfig = {
 			defaultStreamDepot: null,
-			defaultIntegrationMethod: null,
 			isDefaultBot: false,
 			noStreamAliases: false,
 			globalNotify: [],
+			changelistParser: null,
 			triager: null,
 			nagSchedule: null,
 			nagAcknowledgedSchedule: null,
@@ -282,6 +298,7 @@ export class BranchDefs {
 			emailOnBlockage: true,
 			checkIntervalSecs: 30.0,
 			excludeAuthors: [],
+			excludeDescriptions: [],
 			visibility: ['fte'],
 			slackChannel: '',
 			reportToBuildHealth: false,
@@ -292,6 +309,9 @@ export class BranchDefs {
 			badgeUrlOverride: ''
 		}
 
+		let validationErrors: string[] = []
+		let validationWarnings: string[] = []
+
 		let branchGraphRaw: any
 		try {
 			branchGraphRaw = jsonlint.parse(branchSpecsText)
@@ -301,8 +321,8 @@ export class BranchDefs {
 			}
 		}
 		catch (err) {
-			outErrors.push(err)
-			return {branchGraphDef: null, config: defaultConfigForWholeBot}
+			validationErrors.push(err)
+			return {branchGraphDef: null, config: defaultConfigForWholeBot, validationErrors, validationWarnings}
 		}
 
 		if (branchGraphRaw.alias) {
@@ -330,17 +350,13 @@ export class BranchDefs {
 						}
 					}
 					if (!macrosLower) {
-						outErrors.push(`Invalid macro property: '${value}'`)
-						return {branchGraphDef: null, config: defaultConfigForWholeBot}
+						validationErrors.push(`Invalid macro property: '${value}'`)
+						return {branchGraphDef: null, config: defaultConfigForWholeBot, validationErrors, validationWarnings}
 					}
 					value = macrosLower
 				}
 				(defaultConfigForWholeBot as any)[key] = value
 			}
-		}
-
-		if (defaultConfigForWholeBot.defaultIntegrationMethod) {
-			BranchDefs.checkValidIntegrationMethod(outErrors, defaultConfigForWholeBot.defaultIntegrationMethod, 'config')
 		}
 
 		const namesToIgnore = defaultConfigForWholeBot.branchNamesToIgnore.map(s => s.toUpperCase())
@@ -353,23 +369,23 @@ export class BranchDefs {
 		branchGraph.branches = []
 
 		// Check for duplicate branch names
-		for (const def of branchesFromJSON) {
+		await Promise.all(branchesFromJSON.map(async (def) => {
 			if (!def.name) {
-				outErrors.push(`Unable to parse branch definition: ${JSON.stringify(def)}`)
-				continue
+				validationErrors.push(`Unable to parse branch definition: ${JSON.stringify(def)}`)
+				return
 			}
 
 			branchGraph.branches.push(def)
 
 			const nameError = BranchDefs.checkName(def.name)
 			if (nameError) {
-				outErrors.push(nameError)
-				continue
+				validationErrors.push(nameError)
+				return
 			}
 
 			const upperName = def.name.toUpperCase()
 			if (names.has(upperName)) {
-				outErrors.push(`Duplicate branch name '${upperName}'`)
+				validationErrors.push(`Duplicate branch name '${upperName}'`)
 			}
 			else {
 				names.set(upperName, upperName)
@@ -382,43 +398,46 @@ export class BranchDefs {
 				def.streamSubpath
 			)
 
-			if (!isPreviewing && streamResult.stream && !allStreamSpecs.has(streamResult.stream)) {
-				outErrors.push(`Stream ${streamResult.stream} not found`)
+			if (streamResult.stream && !await PerforceContext.getServerContext(logger, def.streamServer).stream(streamResult.stream)) {
+				if (isPreviewing) {
+					validationWarnings.push(`Stream ${streamResult.stream} not found`)
+				} else {
+					validationErrors.push(`Stream ${streamResult.stream} not found`)
+				}
 			}
-		}
+		}))
 
 		// Check for duplicate aliases (and that branches/aliases are not in the ignore list)
 		const addAlias = (upperBranchName: string, upperAlias: string) => {
 			if (namesToIgnore.indexOf(upperBranchName) >= 0) {
-				outErrors.push(upperBranchName + ' branch is in branchNamesToIgnore')
+				validationErrors.push(upperBranchName + ' branch is in branchNamesToIgnore')
 			}
 
 			if (namesToIgnore.indexOf(upperAlias) >= 0) {
-				outErrors.push(upperAlias + ' alias is in branchNamesToIgnore')
+				validationErrors.push(upperAlias + ' alias is in branchNamesToIgnore')
 			}
 
 			if (!upperAlias) {
-				outErrors.push(`Empty alias for '${upperBranchName}'`)
+				validationErrors.push(`Empty alias for '${upperBranchName}'`)
 				return
 			}
 
 			const nameError = BranchDefs.checkName(upperAlias)
 			if (nameError) {
-				outErrors.push(nameError)
+				validationErrors.push(nameError)
 				return
 			}
 
 			const existing = names.get(upperAlias)
 			if (existing && existing !== upperBranchName) {
-				outErrors.push(`Duplicate alias '${upperAlias}' for '${existing}' and '${upperBranchName}'`)
+				validationErrors.push(`Duplicate alias '${upperAlias}' for '${existing}' and '${upperBranchName}'`)
 			}
 			else {
 				names.set(upperAlias, upperBranchName)
 			}
 		}
 
-		for (const def of branchGraph.branches) {
-
+		await Promise.all(branchGraph.branches.map(async (def) => {
 			const upperName = def.name!.toUpperCase()
 			if (def.aliases) {
 				for (const alias of def.aliases) {
@@ -430,28 +449,26 @@ export class BranchDefs {
 				addAlias(upperName, def.streamName.toUpperCase())
 			}
 
-			if (def.integrationMethod) {
-				BranchDefs.checkValidIntegrationMethod(outErrors, def.integrationMethod!, def.name!)
-			}
-
 			// check all properties are known (could make things case insensitive here)
 			for (const keyName of Object.keys(def)) {
 				if (!nodeOptionFieldNames.has(keyName)) {
-					throw new Error(`Unknown property '${keyName}' specified for node ${def.name}`)
+					validationErrors.push(`Unknown property '${keyName}' specified for node ${def.name}`)
 				}
 			}
 
-			validateCommonOptions(def)
-		}
+			const results = await validateCommonOptions(logger, def, isPreviewing)
+			validationErrors.push(...results.errors)
+			validationWarnings.push(...results.warnings)
+		}))
 
 		// Check edge properties
 		if (branchGraph.edges) {
-			for (const edge of branchGraph.edges) {
+			await Promise.all(branchGraph.edges.map(async (edge) => {
 				if (!names.get(edge.from.toUpperCase())) {
-					outErrors.push('Unrecognised source node in edge property ' + edge.from)
+					validationErrors.push('Unrecognised source node in edge property ' + edge.from)
 				}
 				if (!names.get(edge.to.toUpperCase())) {
-					outErrors.push('Unrecognised target node in edge property ' + edge.to)
+					validationErrors.push('Unrecognised target node in edge property ' + edge.to)
 				}
 
 				// check all properties are known (could make things case insensitive here)
@@ -468,8 +485,23 @@ export class BranchDefs {
 					}
 				}
 
-				validateCommonOptions(edge)
-			}
+				if (edge.integrationMethod) {
+					BranchDefs.checkValidIntegrationMethod(validationErrors, edge.integrationMethod, `${edge.from}->${edge.to}`)
+				}
+
+				if (edge.branchspec && !await PerforceContext.getServerContext(logger).branchExists(edge.branchspec)) {
+					if (isPreviewing) {
+						validationWarnings.push(`Branchspec ${edge.branchspec} does not exist.`)
+					} 
+					else {
+						validationErrors.push(`Branchspec ${edge.branchspec} does not exist.`)
+					}
+				}
+
+				const results = await validateCommonOptions(logger, edge, isPreviewing)
+				validationErrors.push(...results.errors)
+				validationWarnings.push(...results.warnings)
+			}))
 		}
 
 		// Check flow
@@ -477,7 +509,7 @@ export class BranchDefs {
 			const flowsTo = new Set()
 			if (def.flowsTo) {
 				if (!Array.isArray(def.flowsTo)) {
-					outErrors.push(`'${def.name}'.flowsTo is not an array`)
+					validationErrors.push(`'${def.name}'.flowsTo is not an array`)
 				}
 				else for (const to of def.flowsTo) {
 					const branchName = names.get(to.toUpperCase())
@@ -485,88 +517,79 @@ export class BranchDefs {
 						flowsTo.add(branchName)
 					}
 					else {
-						outErrors.push(`'${def.name}' flows to unknown branch/alias '${to}'`)
+						validationErrors.push(`'${def.name}' flows to unknown branch/alias '${to}'`)
 					}
 				}
 			}
 
 			if (def.forceFlowTo) {
 				if (!Array.isArray(def.forceFlowTo)) {
-					outErrors.push(`'${def.name}'.forceFlowTo is not an array`)
+					validationErrors.push(`'${def.name}'.forceFlowTo is not an array`)
 				}
 				else for (const to of def.forceFlowTo) {
 					const branchName = names.get(to.toUpperCase())
 					if (!branchName) {
-						outErrors.push(`'${def.name}' force flows to unknown branch/alias '${to}'`)
+						validationErrors.push(`'${def.name}' force flows to unknown branch/alias '${to}'`)
 					}
 					else if (!flowsTo.has(branchName)) {
-						outErrors.push(`'${def.name}' force flows but does not flow to '${to}'`)
+						validationErrors.push(`'${def.name}' force flows but does not flow to '${to}'`)
 					}
+				}
+			}
+
+			if (def.changelistParser) {
+				try {
+					await import(`./changelistparsers/${def.changelistParser}`)
+				}
+				catch {
+					validationErrors.push(`'${def.name}' specifies custom parser '${def.changelistParser}' but unable to import it`)
 				}
 			}
 		}
 
 		// Check branchspecs for valid branches
 		if (branchGraph.branchspecs) {
-			for (const spec of branchGraph.branchspecs) {
+			await Promise.all(branchGraph.branchspecs.map(async (spec) => {
+				let expectedFields = ['from', 'to', 'name']
 				for (const [key, val] of Object.entries(spec)) {
-					if (key !== 'from' && key !== 'to' && key !== 'name') {
-						outErrors.push('Unexpected branchspec property: ' + key)
+					const efLength = expectedFields.length
+					expectedFields = expectedFields.filter(f => f != key)
+					if (efLength == expectedFields.length) {
+						validationErrors.push('Unexpected branchspec property: ' + key)
 					}
 					if (typeof val !== 'string') {
-						outErrors.push(`Branchspec property ${key} is not a string`)
+						validationErrors.push(`Branchspec property ${key} is not a string`)
 					}
 				}
-				if (!spec.from || !spec.to) {
-					outErrors.push(`Invalid branchspec ${spec.name} (requires both to and from fields)`)
+
+				if (expectedFields.length > 0) {
+					validationErrors.push(`Branchspec missing field(s): ${expectedFields.join(', ')}`)
 				}
 
-				if (!names.has(spec.from.toUpperCase())) {
-					outErrors.push(`From-Branch ${spec.from} not found in branchspec ${spec.name}`)
+				if (spec.from && !names.has(spec.from.toUpperCase())) {
+					validationErrors.push(`From-Branch ${spec.from} not found in branchspec ${spec.name}`)
 				}
 
-				if (!names.has(spec.to.toUpperCase())) {
-					outErrors.push(`To-Branch ${spec.to} not found in branchspec ${spec.name}`)
+				if (spec.to && !names.has(spec.to.toUpperCase())) {
+					validationErrors.push(`To-Branch ${spec.to} not found in branchspec ${spec.name}`)
 				}
-			}
+
+				if (spec.name && !await PerforceContext.getServerContext(logger).branchExists(spec.name)) {
+					if (isPreviewing) {
+						validationWarnings.push(`Branchspec ${spec.name} does not exist.`)
+					} 
+					else {
+						validationErrors.push(`Branchspec ${spec.name} does not exist.`)
+					}
+				}
+			}))
 		}
 
-		if (outErrors.length > 0) {
-			console.log(outErrors)
-			return {branchGraphDef: null, config: defaultConfigForWholeBot}
+		if (validationErrors.length > 0) {
+			console.log(validationErrors)
+			return {branchGraphDef: null, config: defaultConfigForWholeBot, validationErrors, validationWarnings}
 		}
 
-		return {branchGraphDef: branchGraph, config: defaultConfigForWholeBot}
+		return {branchGraphDef: branchGraph, config: defaultConfigForWholeBot, validationErrors, validationWarnings}
 	}
 }
-
-// function verifyAllBranchmaps(allStreamSpecs: Map<string, StreamSpec>, folder: string) {
-
-// 	for (const file of fs.readdirSync(folder, {encoding: "utf8"})) {
-// 		if (!file.endsWith('branchmap.json') || file.indexOf('iron.') >= 0) {
-// 			continue
-// 		}
-// 		console.log(file)
-// 		const validationErrors: string[] = []
-
-// 		const result = BranchDefs.parseAndValidate(
-// 			validationErrors,
-// 			fs.readFileSync(path.join(folder, file), 'utf8'),
-// 			allStreamSpecs)
-
-// 		if (!result.branchGraphDef) {
-// 			throw new Error(validationErrors.length === 0 ? 'Failed to parse' : validationErrors.join('\n'))
-// 		}
-// 		console.log(`Branches found in ${file}: ${result.branchGraphDef.branches.length}`)
-// 	}
-// }
-
-// export async function runTests(logger: ContextualLogger) {
-// 	if (process.platform === 'darwin') {
-// 		await initializePerforce(logger)
-// 		const allStreamSpecs = await (new PerforceContext(logger)).streams()
-
-// 		verifyAllBranchmaps(allStreamSpecs, '../RoboMerge/data')
-// 	}
-// 	return 0
-// }

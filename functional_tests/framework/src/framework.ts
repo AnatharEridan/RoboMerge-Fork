@@ -71,8 +71,8 @@ export class P4Client {
 		return this.p4.add(this.user, this.workspace, Path.join(this.root, file), binary)
 	}
 
-	edit(file: string) {
-		return this.p4.edit(this.user, this.workspace, Path.join(this.root, file))
+	edit(file: string, opts?: string[]) {
+		return this.p4.edit(this.user, this.workspace, Path.join(this.root, file), opts)
 	}
 
 	delete(file: string) {
@@ -147,7 +147,6 @@ type RobomergeBranchOptions = {
 	////////////////////
 	// NodeOptionFields
 	disabled: boolean
-	integrationMethod: string
 	forceAll: boolean
 	visibility: string[] | string
 	blockAssetFlow: string[]
@@ -158,8 +157,6 @@ type RobomergeBranchOptions = {
 	streamSubpath: string
 	workspace: (string | null)
 
-	// if set, still generate workspace but use this name
-	workspaceNameOverride: string
 	additionalSlackChannelForBlockages: string
 	ignoreBranchspecs: boolean
 	lastGoodCLPath: string
@@ -171,6 +168,7 @@ type RobomergeBranchOptions = {
 	incognitoMode: boolean
 
 	excludeAuthors: string[] // if present, completely overrides BotConfig
+	excludeDescriptions: string[] // if present, completely overrides BotConfig
 }
 
 export type RobomergeBranchSpec = Partial<RobomergeBranchOptions> & {
@@ -190,12 +188,14 @@ type EdgeOptionFields = {
 	additionalSlackChannel: string
 	initialCL: number
 	p4MaxRowsOverride: number // use with care and check with p4 admins
+	integrationMethod: string
 
 	disallowSkip: boolean
 	incognitoMode: boolean
 	terminal: boolean // changes go along terminal edges but no further
 
 	excludeAuthors: string[]
+	excludeDescriptions: string[]
 
 	// by default, specify when gate catch ups are allowed; can be inverted to disallow
 	integrationWindow: IntegrationWindowPane[]
@@ -204,6 +204,9 @@ type EdgeOptionFields = {
 	implicitCommands: string[]
 
 	ignoreInCycleDetection: boolean
+
+	// if set, still generate workspace but use this name
+	workspaceNameOverride: string
 
 	approval: {
 		description: string
@@ -612,10 +615,13 @@ export abstract class FunctionalTest {
 		let verifyResult: any
 
 		try {
-			const post = bent('POST', 'json', 200, 400)
+			const post = bent('POST', 'json', 200, 400, 500)
 			verifyResult = await post(url)
 
-			// console.dir(verifyResult)
+			if (verifyResult.statusCode == 500) {
+				console.log(verifyResult)
+				throw new Error(`Verify returned 500 (${verifyResult})`)
+			}
 		}
 		catch (err) {
 			this.error(err)
@@ -1103,13 +1109,13 @@ export class P4Util {
 			.then(() => this.submit(client, `Adding file ${name}`))
 	}
 
-	static editFileAndSubmit(client: P4Client, name: string, newContent: string, robomergeCommand?: string) {
-		let commitMessage = `Edited file '${name}'`
+	static editFileAndSubmit(client: P4Client, name: string, newContent: string, robomergeCommand?: string, submitMessage?: string) {
+		let commitMessage = submitMessage || `Edited file '${name}'`
 		if (robomergeCommand) {
 			commitMessage += '\n#robomerge ' + robomergeCommand
 		}
 		return this.editFile(client, name, newContent)
-			.then(() => this.submit(client, commitMessage))
+			.then(() => this.submit(client, commitMessage!))
 	}
 
 	static deleteFileAndSubmit(client: P4Client, name: string, robomergeCommand?: string) {

@@ -2,6 +2,7 @@
 
 import * as request from '../common/request';
 import { ContextualLogger } from '../common/logger';
+import { URLSearchParams } from "url"
 
 export interface SlackChannel {
 	id: string
@@ -68,6 +69,20 @@ export interface SlackMessage {
 	target?: string
 }
 
+export interface SlackFile {
+	content: string
+	channels: string
+	filename?: string
+	filetype?: string
+	initial_comment?: string
+	thread_ts?: string
+	title?: string
+}
+
+enum PostFormat {
+	JSON,
+	URL
+}
 
 const MAIN_MESSAGE_FIELDS = new Set(['username', 'icon_emoji', 'channel', 'target', 'cl']);
 
@@ -86,6 +101,10 @@ export class Slack {
 		return this.get('conversations.info', {channel})
 	}
 
+	async getPermalink(thread_ts: string, channel: string) {
+		return (await this.get('chat.getPermalink', {channel, message_ts: thread_ts})).permalink
+	}
+
 	async postMessage(message: SlackMessage) {
 		return (await this.post('chat.postMessage', this.makeArgs(message))).ts
 	}
@@ -102,16 +121,46 @@ export class Slack {
 		return this.post('chat.postMessage', args)
 	}
 
-// why was message optional?
 	update(ts: string, message: SlackMessage) {
 		const args = this.makeArgs(message)
 		args.ts = ts
 		return this.post('chat.update', args)
 	}
 
+	uploadFile(file: SlackFile) {
+		let getURLargs: any = {
+			filename: file.filename,
+			length: file.content.length
+		}
+		if (file.filetype) {
+			getURLargs.snippet_type = file.filetype // slack API gets snippy if you pass in snippet_type = undefined
+		}
+		return this.post('files.getUploadURLExternal', getURLargs, true, PostFormat.URL)
+			.then( getURLresult => {
+				if (getURLresult.ok) {
+					request.post({
+						url: getURLresult.upload_url,
+						body: file.content,
+						contentType: 'application/x-www-form-urlencoded'
+					}).then(
+						() => {
+							const completeArgs = {
+								files:[{id: getURLresult.file_id, title: file.title}],
+								channel_id: file.channels,
+								initial_comment: file.initial_comment,
+								thread_ts: file.thread_ts
+							}
+							this.post('files.completeUploadExternal', completeArgs)
+						}
+					)
+				}
+			}
+		)
+	}
+
 	listMessages(count?: number) {
 		const args: any = count ? {count} : count
-		// use channels.history if publlic?
+		// use channels.history if public?
 		return this.get('groups.history', args)
 	}
 
@@ -120,19 +169,20 @@ export class Slack {
 		return userLookupResult.ok ? userLookupResult.user.id : null
 	}
 
-	async openDMConversation(users: string | string[]) : Promise<string> {
+	async openDMConversation(users: string | string[]) : Promise<string|null> {
 		if (users instanceof Array) {
 			users = users.join(',')
 		}
-		return (await this.post('conversations.open', {users})).channel.id
+		const result = await this.post('conversations.open', {users})
+		return result.channel ? result.channel.id : null
 	}
 
-	/*private*/ async post_user(userToken: string, command: string, args: any, canFail? : boolean) {
+	/*private*/ async post_user(userToken: string, command: string, args: any, canFail? : boolean, format?: PostFormat) {
 		const resultJson = await request.post({
 			url: this.domain + '/api/' + command,
-			body: JSON.stringify(args),
+			body: format == PostFormat.URL ? new URLSearchParams(Object.entries(args)).toString() : JSON.stringify(args),
 			headers: {Authorization: 'Bearer ' + userToken},
-			contentType: 'application/json; charset=utf-8'
+			contentType: format == PostFormat.URL ? 'application/x-www-form-urlencoded' : 'application/json; charset=utf-8'
 		})
 		try {
 			const result = JSON.parse(resultJson)
@@ -147,8 +197,8 @@ export class Slack {
 		return {ok: false}
 	}
 
-	/*private*/ async post(command: string, args: any, canFail? : boolean) {
-		return this.post_user(this.channel.botToken, command, args, canFail)
+	/*private*/ async post(command: string, args: any, canFail? : boolean, format?: PostFormat) {
+		return this.post_user(this.channel.botToken, command, args, canFail, format)
 	}
 
 	/*private*/ async get(command: string, args: any, canFail? : boolean) {

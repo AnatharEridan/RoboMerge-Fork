@@ -2,13 +2,19 @@
 import { execFile, ExecFileOptions } from 'child_process';
 import * as path from 'path';
 // should really separate out RM-specific operations, but no real gain at the moment
-import { postToRobomergeAlerts } from '../robo/notifications';
+import { isUserAKnownBot, isUserSlackGroup, postToRobomergeAlerts } from '../robo/notifications';
 import { roboAnalytics } from '../robo/roboanalytics';
 import { ContextualLogger, NpmLogLevel } from './logger';
+import { Vault } from '../robo/vault'
 import { VersionReader } from './version';
+import { makeRegexFromPerforcePath } from './p4util';
 
-import * as ztag from './ztag'
+type Type = 'string' | 'integer' | 'boolean'
 
+type ParseOptions = {
+	expected?: {[field: string]: Type}
+	optional?: {[field: string]: Type}
+}
 const p4exe = process.platform === 'win32' ? 'p4.exe' : 'p4';
 const RETRY_ERROR_MESSAGES = [
 	'socket: Connection reset by peer',
@@ -22,9 +28,15 @@ const INTEGRATION_FAILURE_REGEXES: [RegExp, string][] = [
 
 export const EXCLUSIVE_CHECKOUT_REGEX = INTEGRATION_FAILURE_REGEXES[0][0]
 
-const changeResultExpectedShape: ztag.ParseOptions = {
+const REVERT_FAILURE_DUE_TO_MOVE_REGEX: RegExp = /(.*)#[0-9]+ - has been moved, not reverted/
+
+const changeResultExpectedShape: ParseOptions = {
 	expected: {change: 'integer', client: 'string', user: 'string', desc: 'string', time: 'integer', status: 'string', changeType: 'string'},
 	optional: {oldChange: 'integer'}
+}
+
+const describeEntryExpectedShape: ParseOptions = {
+	optional: { depotFile: 'string', action: 'string', rev: 'integer', type: 'string' }
 }
 
 const ztag_group_rex = /\n\n\.\.\.\s/;
@@ -65,6 +77,13 @@ export interface OpenedFileRecord {
 	movedFile?: string
 }
 
+export interface ExclusiveFileDetails {
+	depotPath: string
+	name: string
+	user: string
+	client: string
+}
+
 interface DescribeEntry {
 	depotFile: string
 	action: string
@@ -79,6 +98,11 @@ export interface DescribeResult {
 	path: string
 	entries: DescribeEntry[]
 	date: Date | null
+}
+
+export interface EdgeServer {
+	id: string, 
+	address: string
 }
 
 /**
@@ -182,36 +206,14 @@ export function parseZTag(buffer: string, opts?: ExecZtagOpts) {
 			output.push(text);
 	}
 
+	if (opts && opts.reduce) {
+		return output.reduce((accumulator: any, value: any) => { accumulator = {...accumulator, ...value}; return accumulator; }, {})
+	}
 	return output;
 }
 
-function readObjectListFromZtagOutput(obj: any, keysToLookFo: string[], logger: ContextualLogger) {
-	const result: any = []
-
-	for (let index = 0; ; ++index) {
-		// must be higher than file limit!
-		if (index === 50000) {
-			logger.warn('Parse -ztag WARNING: broke out after 50000 items')
-			break
-		}
-
-		const item: any = {}
-		for (const lookFor of keysToLookFo) {
-			const key = lookFor + index
-			if (obj[key]) {
-				item[lookFor] = obj[key]
-			}
-		}
-		if (Object.keys(item).length === 0)
-			break
-
-		result.push(item)
-	}
-	return result
-}
-
 class CommandRecord {
-	constructor(public cmd: string, public start: Date = new Date()) {
+	constructor(public logger: ContextualLogger, public cmd: string, public start: Date = new Date()) {
 	}
 }
 
@@ -221,13 +223,8 @@ export interface Change {
 	change: number;
 	client: string;
 	user: string;
-	// path?: string;
 	desc: string;
-	// status?: string;
 	shelved?: number;
-
-	// also from Perforce, but maybe not useful
-	changeType?: string;
 	time?: number;
 
 	// hacked in
@@ -254,7 +251,7 @@ export interface Workspace {
 }
 
 // temporary fudging of workspace string used by main Robo code
-export type RoboWorkspace = Workspace | string | null;
+export type RoboWorkspace = Workspace | string | null | undefined;
 
 export interface ClientSpec {
 	client: string
@@ -280,15 +277,16 @@ interface ExecOpts {
 	stdin?: string
 	quiet?: boolean
 	noCwd?: boolean
-	noUsername?: boolean
 	numRetries?: number
 	trace?: boolean
-	edgeServerAddress?: string
+	serverAddress?: string
 }
 
 interface ExecZtagOpts extends ExecOpts {
+	format?: string; // if specified will be passed as the -F argument and the results returned without ztag parsing
 	multiline?: boolean;
 	resolve?: boolean; // hacky solution to clear certain problematic lines out of resolve ztags
+	reduce?: boolean; // collapse the multiple entries to a single object, useful for problem parses that end up in multiple entries despite being a single result
 }
 
 export interface EditChangeOpts {
@@ -307,10 +305,12 @@ export interface IntegrateOpts {
 export interface IntegratedOpts {
 	intoOnly?: boolean
 	startCL?: number
+	quiet?: boolean
 }
 
 export interface SyncParams {
 	opts?: string[]
+	quiet?: boolean
 	edgeServerAddress?: string
 	okToFail?: boolean // default is false
 }
@@ -324,6 +324,15 @@ export interface ConflictedResolveNFile {
 	resolveType: string // e.g. 'content', 'branch'
 	resolveFlag: string // 'c' ?
 	contentResolveType?: string  // e.g. '3waytext', '2wayraw' -- not applicable for delete/branch merges
+}
+
+interface ServerConfig {
+	username: string
+	serverID: string
+	serverAddress?: string
+	serverVersion: number
+	multiServerEnvironment: boolean
+	swarmURL?: string
 }
 
 export class ResolveResult {
@@ -385,7 +394,7 @@ export class ResolveResult {
 
 				["clientFile", "fromFile", "startFromRev", "endFromRev", "resolveType", "resolveFlag"].forEach(function (keyValue) {
 					if (!ztagGroup[keyValue]) {
-						throw new Error(`Resolve output missing ${keyValue} in ztag: ${ztagGroup.toString()}`)
+						throw new Error(`Resolve output missing ${keyValue} in ztag: ${JSON.stringify(ztagGroup)}`)
 					}
 				})
 
@@ -452,41 +461,34 @@ export const getRunningPerforceCommands = () => [...runningPerforceCommands]
 export const P4_FORCE = '-f';
 const robomergeVersion = `v${VersionReader.getBuildNumber()}`
 
-// check if we are logged in and p4 is set up correctly
-let perforceUsername: string
-export function getPerforceUsername() {
-	if (!perforceUsername) {
-		throw new Error('Attempting to access Perforce username information before login completed.')
-	}
-	return perforceUsername
-}
-
-let perforceMultiServerEnvironment: boolean
+const MIN_SERVER_VERSION: number = 2020.1
 
 /**
- * This method must succeed before PerforceContext can be used. Otherwise retrieving the Perforce username through
- * getPerforceUsername() will error.
+ * This method must succeed before PerforceContext can be used. Otherwise retrieving the Perforce context through
+ * getServerContext() will error.
  */
-export async function initializePerforce(logger: ContextualLogger) {
+export async function initializePerforce(logger: ContextualLogger, vault: Vault, devMode: boolean) {
 	setInterval(() => {
 		const now = Date.now()
 		for (const command of runningPerforceCommands) {
 			const durationMinutes = (now - command.start.valueOf()) / (60*1000)
 			if (durationMinutes > 10) {
-				logger.info(`Command still running after ${Math.round(durationMinutes)} minutes: ` + command.cmd)
+				command.logger.info(`Command still running after ${Math.round(durationMinutes)} minutes: ` + command.cmd)
 			}
 		}
 	}, 5*60*1000)
 
-	const output = await PerforceContext._execP4Ztag(logger, null, ["login", "-s"], { noUsername: true });
-	let resp = output[0];
+	PerforceContext.devMode = devMode
+	const servers = vault.valid && vault.perforceServers
 
-	if (resp && resp.User) {
-		perforceUsername = resp.User;
-
-		const serversOutput = await PerforceContext._execP4Ztag(logger, null, ["servers"]);
-		perforceMultiServerEnvironment = serversOutput.length > 1
+	if (servers) {
+		await Promise.all(Array.from(servers).map(([server, serverDetails]) => PerforceContext.initServer(logger, server, serverDetails)))
 	}
+	else {
+		logger.info("Robomerge running in single server mode")
+		await PerforceContext.initServer(logger, "default")
+	}
+
 }
 
 /**
@@ -494,10 +496,134 @@ export async function initializePerforce(logger: ContextualLogger) {
  * internal serialization object.
  */
 export class PerforceContext {
-	username = getPerforceUsername()
 
 	// Use same logger as instance owner, to cut down on context length
-	constructor(private readonly logger: ContextualLogger) {
+	private constructor(private readonly logger: ContextualLogger, private _serverConfig: ServerConfig) {
+	}
+
+	static devMode: boolean
+	static readonly servers: Map<string, ServerConfig> = new Map()
+
+	static async initServer(logger: ContextualLogger, serverID: string, serverDetails?: any) {
+		
+		const serverAddress = serverDetails && serverDetails.port
+
+		let opts: ExecOpts = { serverAddress }
+		let loginArgs = ["login"]
+		if (serverDetails && serverDetails.user) {
+			loginArgs = ["-u", serverDetails.user, ...loginArgs]
+		}
+		if (serverDetails && serverDetails.password) {
+			opts.stdin = serverDetails.password
+		}
+		else {
+			loginArgs.push('-s')
+		}
+
+		const output = await PerforceContext.execAndParse(logger, null, loginArgs, opts);
+		let resp = output[0];
+	
+		if (resp && resp.User) {
+
+			const [rawServerVersion, serversOutput, swarmOutput] = await Promise.all([
+				PerforceContext._execP4(logger, null, ["-u", resp.User, "-ztag","-F","%serverVersion%","info"], { serverAddress} ),
+				PerforceContext.execAndParse(logger, null, ["-u", resp.User, "servers"], { serverAddress }),
+				PerforceContext._execP4(logger, null, ["-u", resp.User, "-ztag", "-F", "%value%", "property", "-l", "-n", "P4.Swarm.URL"], { serverAddress })
+			])
+
+			const match = rawServerVersion.match(/.*\/(\d+\.\d+)\/.*/)
+			if (!match) {
+				throw new Error(`Unable to parse server version from ${rawServerVersion}`)
+			}
+			let serverVersion = parseFloat(match[1])
+			if (serverVersion < MIN_SERVER_VERSION) {
+				throw new Error(`Robomerge requires a minimum server version of ${MIN_SERVER_VERSION}`)
+			}
+	
+			let serverConfig: ServerConfig = {
+				username: resp.User,
+				serverID,
+				serverAddress,
+				serverVersion,
+				multiServerEnvironment: serversOutput.length > 1,
+				swarmURL: swarmOutput.length > 0 ? swarmOutput.trim() : undefined
+			}
+			this.servers.set(serverID, serverConfig)
+
+			if (serverDetails && serverDetails.password) {
+				// We're going to refresh our credentials every hour
+				setInterval(() =>  {
+					PerforceContext.execAndParse(logger, null, loginArgs, opts)
+					.then((output) => {
+						let resp = output[0];
+						if (!resp.User) {
+							logger.warn(`Failed to refresh credentials for ${serverID}: ${serverAddress}. Will try again in 1 hour.`)
+						}
+					})
+					.catch(reason => {
+						if (!isExecP4Error(reason)) {
+							throw reason
+						}
+
+						const [_, output] = reason
+						
+						logger.warn(`Failed to refresh credentials for ${serverID}: ${serverAddress}.\nError: ${output}\n\nWill try again in 1 hour.`)
+					})
+			
+				}, 60*60*1000)
+			}
+
+			if (serverAddress) {
+				logger.info(`P4 server ${serverID}: ${serverAddress} initialized. User=${resp.User}`)
+			}
+			else {
+				logger.info(`P4 initialized. User=${resp.User}`)
+			}
+		}
+		else {
+			throw new Error(`Failed to login to ${serverAddress || "server"}`)
+		}
+	}
+
+	static sameServerID(aID?: string, bID?: string) {
+		return (aID || 'default') === (bID || 'default')
+	}
+
+	static getServerContext(logger: ContextualLogger, serverID?: string) {
+		serverID = serverID || 'default'
+		const server = this.servers.get(serverID)
+		if (!server) {
+			throw new Error(`Unknown server ${serverID}`)
+		}
+		return new PerforceContext(logger, server)
+	}
+
+	static getServerConfig(serverID?: string) {
+		return this.servers.get(serverID || 'default')
+	}
+
+	get username() {
+		return this._serverConfig.username
+	}
+
+	get serverID() {
+		return this._serverConfig.serverID
+	}
+
+	get serverAddress() {
+		return this._serverConfig.serverAddress
+	}
+
+	get serverVersion() {
+		return this._serverConfig.serverVersion
+	}
+
+	get multiServerEnvironment() {
+		return this._serverConfig.multiServerEnvironment
+	}
+
+	get swarmURL() {
+		return this._serverConfig.swarmURL
 	}
 
 	// get a list of all pending changes for this user
@@ -511,52 +637,46 @@ export class PerforceContext {
 			args = [...args, '-c', workspaceName]
 		}
 
-		return this._execP4Ztag(null, args, { multiline: true, edgeServerAddress });
+		return this.execAndParse(null, args, { serverAddress: edgeServerAddress });
 	}
 
-	/** get a single change in the format of changes() */
-	async getChange(path_in: string, changenum: number, status?: ChangelistStatus) {
-		const list = await this.changes(`${path_in}@${changenum},${changenum}`, -1, 1, status, false) as Change[]
-		if (list.length <= 0) {
-			throw new Error(`Could not find changelist ${changenum} in ${path_in}`);
-		}
-		if (list.length > 1 || list[0].change !== changenum) {
-			// log for now
-			const e = new Error();
-			this.logger.error(`${e.stack}\np4.getChange unexpected result for ${changenum}` +
-				list.map(change => `\n    ${change.change}: user ${change.user}, workspace ${change.client}`).join('')
-			)
-		}
-		return list[0]
+	/** get a single change and return it in the format of changes() */
+	async getChange(changenum: number) {
+		let result = (await this.execAndParse(null, ['change', '-o', changenum.toString()]))[0]
+		result.change = parseInt(result.Change)
+		result.client = result.Client
+		result.desc = result.Description
+		result.user = result.User
+		return result
 	}
 
 	/**
 	 * Get a list of changes in a path since a specific CL
 	 * @return Promise to list of changelists
 	 */
-	changes(path_in: string, since: number, limit?: number, status?: ChangelistStatus, quiet?: boolean): Promise<Change[]> {
-		const path = since > 0 ? path_in + '@>' + since : path_in;
+	changes(path_in: string, since: number, limit?: number, status?: ChangelistStatus, quiet: boolean = true): Promise<Change[]> {
+		const path = since > 0 ? `${path_in}@${since},now` : path_in;
 		const args = ['changes', '-l',
 			(status ? `-s${status}` : '-ssubmitted'),
 			...(limit ? [`-m${limit}`] : []),
 			path];
 
-		return this.execAndParse(null, args, {quiet: quiet ? quiet : true}, {
+		return this.execAndParse(null, args, {quiet}, {
 			expected: {change: 'integer', client: 'string', user: 'string', desc: 'string'},
 			optional: {shelved: 'integer', oldChange: 'integer', IsPromoted: 'integer'}
 		}) as Promise<unknown> as Promise<Change[]>
 	}
 
-	async latestChange(path: string): Promise<Change> {
+	async latestChange(path: string, workspace?: RoboWorkspace): Promise<Change> {
 
 		// temporarily waiting 30 seconds - filing ticket   - was: wait no longer than 5 seconds, retry up to 3 times
 		const args = ['-vnet.maxwait=30', '-r3', 'changes', '-l', '-ssubmitted', '-m1', path]
 
 		const startTime = Date.now()
 
-		const result = await this.execAndParse(null, args, {quiet: true, trace: true}, changeResultExpectedShape)
+		const result = await this.execAndParse(workspace, args, {quiet: true, trace: true}, changeResultExpectedShape)
 		if (!result || result.length !== 1) {
-			throw new Error("Expected exactly one change")
+			throw new Error(`Expected exactly one change. Got ${result ? result.length : 0}${result ? '' : '\n' + JSON.stringify(result)}`)
 		}
 
 		const durationSeconds = (Date.now() - startTime) / 1000;
@@ -565,7 +685,7 @@ export class PerforceContext {
 			this.logger.warn(`p4.latestChange took ${durationSeconds}s`)
 		}
 
-		return result[0] as unknown as Change
+		return result[0] as Change
 	}
 
 	changesBetween(path: string, from: number, to: number) {
@@ -573,12 +693,50 @@ export class PerforceContext {
 		return this.execAndParse(null, args, {quiet: true}, changeResultExpectedShape) as Promise<unknown> as Promise<Change[]>
 	}
 
-	async streams() {
-		const rawStreams = await this.execAndParse(null, ['streams'], {quiet: true}, {
-			expected: {Stream: 'string', Update: 'integer', Access: 'integer', Owner: 'string', Name: 'string', Parent: 'string', Type: 'string', desc: 'string',
-				Options: 'string', firmerThanParent: 'string', changeFlowsToParent: 'boolean', changeFlowsFromParent: 'boolean', baseParent: 'string'}
-		})
+	async getDepot(depotName: string) {
+		if ((await this.execAndParse(null, ['depots', '-e', depotName])).length > 0)
+		{
+			return (await this.execAndParse(null, ['depot', '-o', depotName]))[0]
+		}
+		return null
+	}
 
+	async getStreamName(path: string) {
+		// Given the path, determine the depot and stream that a workspace needs to be created for
+		let depotEndChar = path.indexOf('/',2)
+		if (depotEndChar == -1) {
+			return new Error(`Unable to determine depot from $(path)`)
+		}
+
+		const depot = await this.getDepot(path.substring(2,depotEndChar))
+		if (!depot) {
+			throw new Error(`Unable to find ${depot}`)
+		}
+		if (depot.Type == 'stream') {
+			let streamDepth = depot.StreamDepth.match(/\//g).length - 2
+			if (streamDepth < 1) {
+				streamDepth = Number(depot.StreamDepth)
+			}
+			let streamNameEnd = 2;
+			for (let i=0;i<streamDepth+1;i++) {
+				let nextSlash = path.indexOf("/",streamNameEnd+1)
+				if (nextSlash == -1) {
+					if (i == streamDepth) {
+						return path
+					}
+					else {
+						return new Error(`Unable to determine stream from ${path}: not enough depth`)
+					}
+				}
+				streamNameEnd = path.indexOf("/",streamNameEnd+1)
+			}
+			return path.substring(0,streamNameEnd)
+		}
+		return new Error(`Depot ${depot} is not of type stream`)
+	}
+
+	async streams() {
+		const rawStreams = await this.execAndParse(null, ['streams'], {quiet: true})
 		const streams = new Map<string, StreamSpec>()
 		for (const raw of rawStreams) {
 			const stream: StreamSpec = {
@@ -592,6 +750,31 @@ export class PerforceContext {
 		return streams
 	}
 
+	async stream(streamName: string) {
+		try {
+			const stream = (await this.execAndParse(null, ['streams', streamName]))[0]
+			const streamSpec: StreamSpec = {
+				stream: stream.Stream as string,
+				name: stream.Name as string,
+				parent: stream.Parent as string,
+				desc: stream.desc as string,
+			}
+			return streamSpec
+		}
+		catch {
+			return null
+		}
+	}
+
+	async branchExists(branchName: string) {
+		try {
+			return (await this.execAndParse(null, ['branches','-e',branchName])).length == 1
+		}
+		catch {
+			return false
+		}
+	}
+
 	// find a workspace for the given user
 	// output format is an array of workspace names
 	async find_workspaces(user?: string, options?: {edgeServerAddress?: string, includeUnloaded?: boolean}) {
@@ -601,21 +784,19 @@ export class PerforceContext {
 
 		let args = ['clients', '-u', user || this.username]
 
-		// -a to include workspaces on edge servers
-		if (!edgeServerAddress) {
-			// find all
-			args.push('-a')
-		}
-
-		let opts: ExecZtagOpts = { multiline: true }
+		let opts: ExecOpts = {}
 		if (edgeServerAddress && edgeServerAddress !== 'commit') {
-			opts.edgeServerAddress = edgeServerAddress
+			opts.serverAddress = edgeServerAddress
+		}
+		else {
+			// -a to include workspaces on edge servers
+			args.push('-a')
 		}
 
 		let workspaces = [];
 		try {
-			let parsedLoadedClients = this._execP4Ztag(null, args, opts);
-			let parsedUnloadedClients = (includeUnloaded ? this._execP4Ztag(null, [...args, '-U'], opts) : null)
+			let parsedLoadedClients = this.execAndParse(null, args, opts);
+			let parsedUnloadedClients = (includeUnloaded ? this.execAndParse(null, [...args, '-U'], opts) : null)
 			for (let clientDef of await parsedLoadedClients) {
 				if (clientDef.client) {
 					workspaces.push(clientDef);
@@ -634,13 +815,6 @@ export class PerforceContext {
 				throw reason
 			}
 
-			let [err, output] = reason
-
-			// if this change has already been integrated, this is a special return (still a success)
-			if (!output.includes("Revision chars (@, #) not allowed in")) {
-				throw err
-			}
-
 			const errorMsg = `Attempted to find workspaces for invalid user ${user || this.username}`
 			this.logger.error(errorMsg)
 			postToRobomergeAlerts(errorMsg)
@@ -649,11 +823,31 @@ export class PerforceContext {
 		return workspaces as ClientSpec[];
 	}
 
-	find_workspace_by_name(workspaceName: string) {
-		return this._execP4Ztag(null, ['clients', '-E', workspaceName]);
+	async find_workspace_by_name(workspaceName: string, options?: {edgeServerAddress?: string, includeUnloaded?: boolean}) {
+
+		const edgeServerAddress = options && options.edgeServerAddress
+		const includeUnloaded = options && options.includeUnloaded
+
+		let args = ['clients', '-E', workspaceName]
+
+		let opts: ExecOpts = {}
+		if (edgeServerAddress && edgeServerAddress !== 'commit') {
+			opts.serverAddress = edgeServerAddress
+		}
+		else {
+			// -a to include workspaces on edge servers
+			args.push('-a')
+		}
+
+		let result = await this.execAndParse(null, args, opts);
+		if (includeUnloaded && result.length == 0) {
+			result = await this.execAndParse(null, [...args, '-U'], opts)
+		}
+
+		return result
 	}
 
-	async getWorkspaceEdgeServer(workspaceName: string): Promise<{id: string, address: string} | null> {
+	async getWorkspaceEdgeServer(workspaceName: string): Promise<EdgeServer | null> {
 		const serverIdLine = await this._execP4(null, ['-ztag', '-F', '%ServerID%', 'client', '-o', workspaceName]) 
 		if (serverIdLine) {
 			const serverId = serverIdLine.trim()
@@ -666,19 +860,35 @@ export class PerforceContext {
 		return null
 	}
 
-	reloadWorkspace(workspaceName: string, edgeServerAddress?: string) {
-		return this._execP4Ztag(null, ['reload', '-c', workspaceName], {edgeServerAddress});
+	async reloadWorkspace(workspaceName: string, edgeServerAddress?: string) {
+		let result
+		try {
+			 result = await this.execAndParse(null, ['reload', '-c', workspaceName], {serverAddress: edgeServerAddress});
+		}
+		catch (reason) {
+			if (!isExecP4Error(reason)) {
+				throw reason
+			}
+			const [err, output] = reason
+
+			// reload succeeds with an error because ... sigh
+			if (!output.trim().startsWith('Client') ||
+				!output.trim().endsWith('reloaded.')) {
+				throw err
+			}
+			result = output;			
+		}
+		return result
 	}
 
 	getEdgeServerAddress(serverId: string) {
 		return this._execP4(null, ['-ztag', '-F', '%Address%', 'server', '-o', serverId])
 	}
 
-	async clean(roboWorkspace: RoboWorkspace) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
+	async clean(roboWorkspace: RoboWorkspace, edgeServerAddress?: string) {
 		let result;
 		try {
-			result = await this._execP4(workspace, ['clean', '-e', '-a']);
+			result = await this._execP4(roboWorkspace, ['clean', '-e', '-a'], {serverAddress: edgeServerAddress});
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -696,16 +906,13 @@ export class PerforceContext {
 	}
 
 	// sync the depot path specified
-	async sync(roboWorkspace: RoboWorkspace, depotPath: string, params?: SyncParams) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		let args = params && params.edgeServerAddress ? ['-p', params.edgeServerAddress] : []
-		args.push('sync')
-		if (params && params.opts) {
-			args = [...args, ...params.opts]
+	async sync(roboWorkspace: RoboWorkspace, depotPath: string|string[], params?: SyncParams) {
+		if (typeof depotPath === "string") {
+			depotPath = [depotPath]
 		}
-		args.push(depotPath)
+		const args = ['sync', ...(params && params.opts || []), ...depotPath]
 		try {
-			await this._execP4(workspace, args)
+			return await this.execAndParse(roboWorkspace, args, {serverAddress: params?.edgeServerAddress, quiet: params?.quiet})
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -719,19 +926,11 @@ export class PerforceContext {
 				}
 			}
 		}
+
+		return []
 	}
 
-	async syncAndReturnChangelistNumber(roboWorkspace: RoboWorkspace, depotPath: string, opts?: string[]) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		const change = await this.latestChange(depotPath);
-		if (!change) {
-			throw new Error('Unable to find changelist');
-		}
-		await this.sync(workspace, `${depotPath}@${change.change}`, {opts});
-		return change.change;
-	}
-
-	async newWorkspace(workspaceName: string, params: any, edgeServer?: {id: string, address: string}) {
+	newWorkspace(workspaceName: string, params: any, edgeServer?: EdgeServer) {
 		params.Client = workspaceName
 		if (!('Root' in params)) {
 			params.Root = 'd:/ROBO/' + workspaceName // default windows path
@@ -755,7 +954,7 @@ export class PerforceContext {
 
 		let args = ['client', '-i']
 		if (edgeServer) {
-			args = ['-p', edgeServer.address, ...args, `--serverid=${edgeServer.id}`]
+			params.ServerID = edgeServer.id
 		}
 
 		let workspaceForm = ''
@@ -774,16 +973,16 @@ export class PerforceContext {
 
 		// run the p4 client command
 		this.logger.info(`Executing: 'p4 client -i' to create workspace ${workspaceName}`);
-		return this._execP4(null, args, { stdin: workspaceForm, quiet: true });
+		return this._execP4(null, args, { stdin: workspaceForm, quiet: true, serverAddress: edgeServer?.address });
 	}
 
 	// Create a new workspace for Robomerge GraphBot
-	async newGraphBotWorkspace(name: string, extraParams: any, edgeServer?: {id: string, address: string}) {
+	newGraphBotWorkspace(name: string, extraParams: any, edgeServer?: EdgeServer) {
 		return this.newWorkspace(name, {Root: getRootDirectoryForBranch(name), ...extraParams}, edgeServer);
 	}
 
 	// Create a new workspace for Robomerge to read branchspecs from
-	async newBranchSpecWorkspace(workspace: Workspace, bsDepotPath: string) {
+	newBranchSpecWorkspace(workspace: Workspace, bsDepotPath: string) {
 		let roots: string | string[] = '/app/data' // default linux path
 		if (workspace.directory !== roots) {
 			roots = [roots, workspace.directory] // specified directory
@@ -827,7 +1026,7 @@ export class PerforceContext {
 		this.logger.info("Executing: 'p4 change -i' to create a new CL");
 		while (true) {
 			try {
-				const output = await this._execP4(workspace, ['change', '-i'], { stdin: form, quiet: true, edgeServerAddress });
+				const output = await this._execP4(workspace, ['change', '-i'], { stdin: form, quiet: true, serverAddress: edgeServerAddress });
 				// parse the CL out of output
 				const match = output.match(/Change (\d+) created./);
 				if (!match) {
@@ -853,6 +1052,175 @@ export class PerforceContext {
 		}
 	}
 
+	async transfer(targetP4: PerforceContext, roboWorkspace: RoboWorkspace, source: IntegrationSource, dest_changelist: number, target: IntegrationTarget, printIfFailures: boolean)
+	: Promise<string[]> {
+
+		// TODO: support branchspecs
+		if (source.branchspec) {
+			return ["Branchspecs not yet supported for transfers."]
+		}
+
+		const files = await this.files(`${source.path_from}@=${source.changelist}`)
+
+		let failures: string[] = []
+
+		const p4quiet = !PerforceContext.devMode
+		const sourceStreamLength = source.stream!.length
+		const targetFilter = `${target.stream!}/...` == target.path_to ? null : makeRegexFromPerforcePath(target.path_to)
+
+		let sortedFiles = new Map<string, any[]>()
+		const addSortedFile = (key: string, file: any) => {
+			if (!sortedFiles.has(key)) {
+				sortedFiles.set(key,[])
+			}
+			sortedFiles.get(key)!.push(file)
+		}
+
+		files.forEach(file => {
+			const targetDepotFile = target.stream! + file.depotFile.substring(sourceStreamLength)
+			if (targetFilter && !targetDepotFile.match(targetFilter)) {
+				// filter out files that don't match the target.path_to
+				return
+			}
+			switch(file.action) {
+				case 'add':
+				case 'branch': {
+					addSortedFile(`add:${file.type}`, [file, targetDepotFile])
+					break
+				}
+				case 'edit':
+				case 'integrate': {
+					addSortedFile(`edit:${file.type}`, [file, targetDepotFile])
+					break
+				}
+				case 'delete': {
+					addSortedFile('delete', [file, targetDepotFile])
+					break
+				}
+				case 'move/delete': {
+					addSortedFile('move', [file, targetDepotFile])
+					break
+				}
+				case 'move/add': break // move/add is handled from the move/delete portion of the pair
+
+				default: {
+					failures.push(`Unhandled transfer action ${file.action} for ${file.depotFile} in CL# ${source.changelist}`)
+				}
+			}
+		})
+
+		let promises: Promise<any>[] = []
+		let printCommands: any[] = []
+
+		const FILES_PER_ACTION = 100
+
+		const HandleCaughtError = (reason: any, filterOut?: (s: string) => boolean) => {
+			if (!isExecP4Error(reason)) {
+				failures.push(reason)
+			}
+
+			const [_, output] = reason
+			let reasons = output.split('\n')
+			if (filterOut) {
+				reasons = reasons.filter((s: string) => s.length > 0 && !filterOut(s))
+			}
+			failures.push(...reasons)
+		}
+
+		sortedFiles.forEach((files, action) => {
+			if (action.startsWith('add')) {
+				const fileType = action.slice(4)
+				for (let i=0; i < files.length; i += FILES_PER_ACTION) {
+					const filesSlice = files.slice(i,i+FILES_PER_ACTION)
+					const targetDepotFiles = filesSlice.map(([_, targetDepotFile]) => targetDepotFile)
+					promises.push(
+						targetP4.add(roboWorkspace, dest_changelist, targetDepotFiles, fileType, p4quiet)
+						        .then(adds => adds.forEach((add, index) => printCommands.push([`${filesSlice[index][0].depotFile}@${source.changelist}`, add.clientFile])))
+						        .catch(reason => HandleCaughtError(reason))
+					)
+				}
+			}
+			else if (action.startsWith('edit')) {
+				const fileType = action.slice(5)
+				for (let i=0; i < files.length; i += FILES_PER_ACTION) {
+					const filesSlice = files.slice(i,i+FILES_PER_ACTION)
+					const targetDepotFiles = filesSlice.map(([_, targetDepotFile]) => targetDepotFile)
+					promises.push(
+						targetP4.sync(roboWorkspace, targetDepotFiles, {opts: ['-k'], quiet: p4quiet})
+						        .then(syncs => { 
+									syncs.forEach((sync, index) => printCommands.push([`${filesSlice[index][0].depotFile}@${source.changelist}`, sync.clientFile]))
+									return targetP4.edit(roboWorkspace, dest_changelist, targetDepotFiles, ['-k', '-t', fileType], p4quiet)
+									               .catch(reason => HandleCaughtError(reason))
+						        })
+						        .catch(reason => HandleCaughtError(reason))
+					)
+				}
+			}
+			else if (action === 'delete') {
+				for (let i=0; i < files.length; i += FILES_PER_ACTION) {
+					promises.push(
+						targetP4.delete(roboWorkspace, dest_changelist, files.slice(i,i+FILES_PER_ACTION).map(([_, targetDepotFile]) => targetDepotFile), p4quiet)
+						.catch(reason => HandleCaughtError(reason, s => s.endsWith("file(s) not on client.")))
+					)
+				}
+			}
+			else if (action === 'move') {
+				promises.push(...files.map(([file, targetDepotFile]) => {
+					return this.integrated(null, file.depotFile, {intoOnly: true, startCL: source.changelist, quiet: p4quiet})
+					.then(integrated => {
+						const integ = integrated.find(integ => parseInt(integ.change) == source.changelist)
+						if (integ) {
+							const targetMoveAddDepotFile = target.stream! + integ.fromFile.substring(sourceStreamLength)
+							return targetP4.sync(roboWorkspace, targetDepotFile, {quiet: p4quiet})
+							.then(() => { return targetP4.edit(roboWorkspace, dest_changelist, targetDepotFile, undefined, p4quiet) })
+							.then(() => { return targetP4.move(roboWorkspace, dest_changelist, targetDepotFile, targetMoveAddDepotFile, ['-f'], p4quiet) })
+							.then(move => printCommands.push([`${integ.fromFile}@${source.changelist}`, move[0].path]))
+							.catch(reason => HandleCaughtError(reason))
+						}
+						else {
+							failures.push(`Unable to look up integrated record for ${file.depotFile} in CL# ${source.changelist}`)
+							return
+						}
+					})
+				}))
+			}
+			else {
+				throw new Error(`Unexpected action ${action} in sortedFiles map`)
+			}
+		})
+
+		await Promise.all(promises)
+
+		const MAX_PRINT_FAILURES = 10
+		let failedPrints = 0
+		if (printIfFailures || failures.length == 0) {
+			const PARALLEL_PRINTS = 25
+			const doPrints = async (startIndex: number) => {
+				for (let i=startIndex; i < printCommands.length; i += PARALLEL_PRINTS) {
+					while (failedPrints < MAX_PRINT_FAILURES) {
+						try {
+							await this.print(printCommands[i][0],printCommands[i][1])
+							break
+						} catch(reason) {
+							if (!isExecP4Error(reason)) {
+								throw reason
+							}
+							const [err, _] = reason
+							this.logger.warn(err)
+							failedPrints++
+						}
+					}
+				}
+			}
+			await Promise.all(Array.from(Array(PARALLEL_PRINTS).keys()).map(n => doPrints(n)))
+		}
+		if (failedPrints == MAX_PRINT_FAILURES) {
+			failures.push(`Failed p4 print ${MAX_PRINT_FAILURES} times. Aborting. See log for failures.`)
+		}
+
+		return failures
+	}
+
 	// integrate a CL from source to destination, resolve, and place the results in a new CL
 	// output format is true if the integration resolved or false if the integration wasn't necessary (still considered a success)
 	// failure to resolve is treated as an error condition
@@ -860,7 +1228,6 @@ export class PerforceContext {
 		: Promise<[string, (Change | string)[]]> {
 
 		opts = opts || {};
-		const workspace = coercePerforceWorkspace(roboWorkspace);
 
 		// build a command
 		let cmdList = [
@@ -878,6 +1245,10 @@ export class PerforceContext {
 		let noSuchFilesPossible = false // Helper variable for error catching
 		// Branchspec -- takes priority above other possibilities
 		if (source.branchspec) {
+			if (this.serverVersion >= 2024.1) {
+				// 2024.1 now prevents merges between streams by default
+				cmdList.push("-F")
+			}
 			cmdList.push("-b");
 			cmdList.push(source.branchspec.name);
 			if (source.branchspec.reverse) {
@@ -897,6 +1268,10 @@ export class PerforceContext {
 		}
 		// Basic branch to branch
 		else {
+			if (this.serverVersion >= 2024.1) {
+				// 2024.1 now prevents merges between streams by default
+				cmdList.push("-F")
+			}
 			cmdList.push(source.path_from + range);
 			cmdList.push(target.path_to);
 		}
@@ -904,7 +1279,7 @@ export class PerforceContext {
 		// execute the P4 command
 		let changes;
 		try {
-			changes = await this._execP4Ztag(workspace, cmdList, { numRetries: 0, edgeServerAddress: opts.edgeServerAddress });
+			changes = await this.execAndParse(roboWorkspace, cmdList, { numRetries: 0, serverAddress: opts.edgeServerAddress });
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -966,7 +1341,7 @@ export class PerforceContext {
 	async resolveHelper(workspace: Workspace | null, flag: string, changelist: number, edgeServerAddress?: string): Promise<any> {
 		try {
 			// Perform merge
-			return await this._execP4Ztag(workspace, ['resolve', flag, `-c${changelist}`], {edgeServerAddress})
+			return await this._execP4Ztag(workspace, ['resolve', flag, `-c${changelist}`], {serverAddress: edgeServerAddress})
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1043,7 +1418,7 @@ export class PerforceContext {
 
 		let dashNresult: string[]
 		try {
-			dashNresult = await this._execP4Ztag(workspace, ['resolve', '-N', `-c${changelist}`], {edgeServerAddress, resolve: true})
+			dashNresult = await this._execP4Ztag(workspace, ['resolve', '-N', `-c${changelist}`], {serverAddress: edgeServerAddress, resolve: true})
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1067,10 +1442,9 @@ export class PerforceContext {
 	// submit a CL
 	// output format is final CL number or false if changes need more resolution
 	async submit(roboWorkspace: RoboWorkspace, changelist: number, edgeServerAddress?: string): Promise<number | string> {
-		const workspace = coercePerforceWorkspace(roboWorkspace)
 		let rawOutput: string
 		try {
-			rawOutput = await this._execP4(workspace, ['-ztag', 'submit', '-f', 'submitunchanged', '-c', changelist.toString()], {edgeServerAddress})
+			rawOutput = await this._execP4(roboWorkspace, ['-ztag', 'submit', '-f', 'submitunchanged', '-c', changelist.toString()], {serverAddress: edgeServerAddress})
 		}
 		catch ([errArg, output]) {
 			const err = errArg.toString().trim()
@@ -1102,7 +1476,7 @@ export class PerforceContext {
 			}
 			else if (out.startsWith('No files to submit.')) {
 				this.logger.info(`=== SUBMIT FAIL === \nERR:${err}\nOUT:${out}`);
-				await this.deleteCl(workspace, changelist)
+				await this.deleteCl(roboWorkspace, changelist)
 				return 0
 			}
 			else if (out.startsWith('Submit validation failed')) {
@@ -1148,14 +1522,50 @@ export class PerforceContext {
 
 	// delete a CL
 	// output format is just error or not
-	deleteCl(roboWorkspace: RoboWorkspace, changelist: number, edgeServerAddress?: string) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		return this._execP4(workspace, ["change", "-d", changelist.toString()], {edgeServerAddress});
+	async deleteCl(roboWorkspace: RoboWorkspace, changelist: number, edgeServerAddress?: string) {
+		try {
+			await this._execP4(roboWorkspace, ["change", "-d", changelist.toString()], {serverAddress: edgeServerAddress})
+		}
+		catch (reason) {
+			if (!isExecP4Error(reason)) {
+				throw reason
+			}
+
+			let [_, output] = reason
+			if (!output.match(/Change (\d+) unknown\./)) {
+				throw reason
+			}
+		}
+	}
+
+	async getOpenedDetails(paths: {depotPath: string, name: string}[]) {
+		const results: ExclusiveFileDetails[] = []
+		const openedRequests: [{depotPath: string, name: string}, Promise<OpenedFileRecord[]>, boolean][] = []
+		for (const path of paths) {
+			openedRequests.push([path, this.opened(null, path.depotPath, true), true])
+		}
+
+		const failedResults: ExclusiveFileDetails[] = []
+		for (const [path, request, exclusive] of openedRequests) {
+			const recs = await request
+			if (recs.length > 0) {
+				// should only be one, since we're looking for exclusive check-out errors
+				results.push({depotPath: path.depotPath, name: path.name, user: recs[0].user, client: recs[0].client})
+			} else if (exclusive) {
+				// if we failed to find it as an exclusive check-out, try as non-exclusive which will find adds
+				openedRequests.push([path, this.opened(null, path.depotPath), false])
+			} else {
+				this.logger.warn(`Failed to get the opened status of ${path.depotPath}`)
+				failedResults.push({depotPath: path.depotPath, name: path.name, user: "", client: ""})
+			}
+		}
+		results.push(...failedResults)
+
+		return results
 	}
 
 	// run p4 'opened' command: lists files in changelist with details of edit state (e.g. if a copy, provides source path)
 	opened(roboWorkspace: RoboWorkspace | null, arg: number | string, exclusive?: boolean) {
-		const workspace = roboWorkspace && coercePerforceWorkspace(roboWorkspace);
 		const args = ['opened']
 		if (typeof arg === 'number') {
 			// see what files are open in the given changelist
@@ -1163,9 +1573,9 @@ export class PerforceContext {
 		}
 		else {
 			// see which workspace has a file checked out/added
-			args.push(exclusive && perforceMultiServerEnvironment ? '-x' : '-a', arg)
+			args.push(exclusive && this.multiServerEnvironment ? '-x' : '-a', arg)
 		}
-		return this._execP4Ztag(workspace, args) as Promise<OpenedFileRecord[]>
+		return this.execAndParse(roboWorkspace, args) as Promise<OpenedFileRecord[]>
 	}
 
 	async revertFile(file: string) {
@@ -1185,7 +1595,22 @@ export class PerforceContext {
 		const edgeServer = await this.getWorkspaceEdgeServer(client)
 		const args = ['revert', '-C', client, ...files]
 		try {
-			await this._execP4Ztag(null, args, {edgeServerAddress: edgeServer?.address})
+			const results = await this.execAndParse(null, args, {serverAddress: edgeServer?.address})
+
+			// Files can fail to be reverted because of moves, lets try and resolve that
+			const movedFiles = 
+				results.filter((result: any) => !result.action)
+					   .reduce((matches: string[], results: string[]) => 
+					   		matches.concat(
+								results.map(result => result.match(REVERT_FAILURE_DUE_TO_MOVE_REGEX))
+								       .filter(match => match)
+								       .map(match => match![1])
+							), [])
+			if (movedFiles.length > 0) {
+				const openedFiles = await this.execAndParse(null, ['opened','-a', ...movedFiles])
+				const pairedAdds: string[] = openedFiles.map((openedFile: any) => openedFile.movedFile)
+				await this.revertFiles(pairedAdds, client)
+			}
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1208,7 +1633,7 @@ export class PerforceContext {
 		try {
 			await this._execP4(workspace, ['revert',
 				/*"-w", seems to cause ENOENT occasionally*/ ...(opts || []), '-c', changelist.toString(), path],
-				{edgeServerAddress});
+				{serverAddress: edgeServerAddress});
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1217,17 +1642,24 @@ export class PerforceContext {
 
 			let [err, output] = reason
 			// this happens if there's literally nothing in the CL. consider this a success
-			if (!output.match(/file\(s\) not opened (?:on this client|in that changelist)\./)) {
+			if (!output.match(/file\(s\) not opened (?:on this client|in that changelist)\./) &&
+				!output.match(/Change (\d+) unknown\./)) {
 				throw err;
 			}
 		}
 	}
 
+	revertAndDelete(roboWorkspace: string, cl: number, edgeServerAddress?: string) {
+		return this.revert(roboWorkspace, cl, [], edgeServerAddress)
+		.then(() => {
+			return this.deleteCl(roboWorkspace, cl, edgeServerAddress);	
+		})
+	}
+
 	// list files in changelist that need to be resolved
 	async listFilesToResolve(roboWorkspace: RoboWorkspace, changelist: number) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
 		try {
-			return await this._execP4Ztag(workspace, ['resolve', '-n', '-c', changelist.toString()]);
+			return await this.execAndParse(roboWorkspace, ['resolve', '-n', '-c', changelist.toString()]);
 		}
 		catch (err) {
 			if (err.toString().toLowerCase().includes('no file(s) to resolve')) {
@@ -1237,29 +1669,26 @@ export class PerforceContext {
 		}
 	}
 
-	async move(roboWorkspace: RoboWorkspace, cl: number, src: string, target: string, opts?: string[]) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		return this._execP4(workspace, ['move', ...(opts || []), '-c', cl.toString(), src, target]);
+	async move(roboWorkspace: RoboWorkspace, cl: number, src: string, target: string, opts?: string[], quiet?: boolean) {
+		return this.execAndParse(roboWorkspace, ['move', ...(opts || []), '-c', cl.toString(), src, target], {quiet});
 	}
 
 	/**
 	 * Run a P4 command by name on one or more files (one call per file, run in parallel)
 	 */
 	run(roboWorkspace: RoboWorkspace, action: string, cl: number, filePaths: string[], opts?: string[]) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
 		const args = [action, ...(opts || []), '-c', cl.toString()]
 		return Promise.all(filePaths.map(
-			path => this._execP4(workspace, [...args, path])
+			path => this._execP4(roboWorkspace, [...args, path])
 		));
 	}
 
 	// shelve a CL
 	// output format is just error or not
 	async shelve(roboWorkspace: RoboWorkspace, changelist: number, edgeServerAddress?: string) {
-		const workspace = coercePerforceWorkspace(roboWorkspace)
 		try {
-			await this._execP4(workspace, ['shelve', '-f', '-c', changelist.toString()],
-				{ numRetries: 0, edgeServerAddress })
+			await this._execP4(roboWorkspace, ['shelve', '-f', '-c', changelist.toString()],
+				{ numRetries: 0, serverAddress: edgeServerAddress })
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1279,9 +1708,8 @@ export class PerforceContext {
 	// shelve a CL
 	// output format is just error or not
 	async unshelve(roboWorkspace: RoboWorkspace, changelist: number) {
-		const workspace = coercePerforceWorkspace(roboWorkspace)
 		try {
-			await this._execP4(workspace, ['unshelve', '-s', changelist.toString(), '-f', '-c', changelist.toString()])
+			await this._execP4(roboWorkspace, ['unshelve', '-s', changelist.toString(), '-f', '-c', changelist.toString()])
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1299,43 +1727,76 @@ export class PerforceContext {
 
 	// delete shelved files from a CL
 	delete_shelved(roboWorkspace: RoboWorkspace, changelist: number) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		return this._execP4(workspace, ["shelve", "-d", "-c", changelist.toString(), "-f"]);
+		return this._execP4(roboWorkspace, ["shelve", "-d", "-c", changelist.toString(), "-f"]);
+	}
+
+	async getUser(username: string) {
+		if (username.length > 0 && !isUserSlackGroup(username) && !isUserAKnownBot(username)) {
+			try {
+				return (await this.execAndParse(null, ['users', username], {quiet:true}))[0]
+			}
+			catch (reason) {
+				if (!isExecP4Error(reason)) {
+					throw reason
+				}
+	
+				let [err, output] = reason
+				if (output.includes('no such user')) {
+					return null
+				}
+				throw err
+			}
+		}
+		return null
 	}
 
 	// get the email (according to P4) for a specific user
 	async getEmail(username: string) {
-		let m = null
-		if (!username.startsWith('@')) {
-			const output = await this._execP4(null, ['user', '-o', username]);
-			// look for the email field
-			m = output.match(/\nEmail:\s+([^\n]+)\n/);
-		}
-		return m && m[1];
+		const user = await this.getUser(username)
+		return user && user.Email
 	}
 
 	/** Check out a file into a specific changelist ** ASYNC ** */
-	edit(roboWorkspace: RoboWorkspace, cl: number, filePath: string, additionalArgs?: string[]) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
+	edit(roboWorkspace: RoboWorkspace, cl: number, filePath: string|string[], additionalArgs?: string[], quiet?: boolean) {
+		if (typeof filePath === "string") {
+			filePath = [filePath]
+		}
 		const args = [
 			'edit', 
 			'-c', cl.toString(), 
 			...(additionalArgs || []),
-			filePath
+			...filePath
 		]
-		return this._execP4(workspace, args);
+		return this.execAndParse(roboWorkspace, args, {quiet});
 	}
 
 	/** Add a file into a specific changelist ** ASYNC ** */
-	add(roboWorkspace: RoboWorkspace, cl: number, filePath: string, filetype?: string) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
+	add(roboWorkspace: RoboWorkspace, cl: number, filePath: string|string[], filetype?: string, quiet?: boolean) {
+		if (typeof filePath === "string") {
+			filePath = [filePath]
+		}
 		const args = [
-			'add', 
+			'add',
+			'-f',
 			'-c', cl.toString(), 
 			...(filetype ? ['-t', filetype] : []),
-			filePath
+			...filePath
 		]
-		return this._execP4(workspace, args);
+		return this.execAndParse(roboWorkspace, args, {quiet});
+	}
+
+	/** Mark a file for delete into a specific changelist ** ASYNC ** */
+	delete(roboWorkspace: RoboWorkspace, cl: number, filePath: string|string[], quiet?: boolean) {
+		if (typeof filePath === "string") {
+			filePath = [filePath]
+		}
+		const args = [
+			'delete', 
+			'-c', cl.toString(),
+			'-v',
+			...filePath
+		]
+		return this.execAndParse(roboWorkspace, args, {quiet});
 	}
 
 	async describe(cl: number, maxFiles?: number, includeShelved?: boolean) {
@@ -1343,38 +1804,48 @@ export class PerforceContext {
 			...(maxFiles ? ['-m', maxFiles.toString()] : []),
 			...(includeShelved ? ['-S'] : []),
 			cl.toString()]
-		const ztagResult = await this._execP4Ztag(null, args, { multiline:true });
+		let result = (await this.execAndParseArray(null, args, undefined, undefined, describeEntryExpectedShape))[0]
+		result.user = result.user || ''
+		result.status = result.status || ''
+		result.description = result.desc || ''
+		result.date = result.time ? new Date(result.time * 1000) : null
 
-		if (ztagResult.length > 2) {
-			throw new Error('Unexpected describe result')
+		return result as DescribeResult;
+	}
+
+	async dirs(path: string) {
+		if (path.endsWith("/...")) {
+			path = path.substring(0,path.length-3) + "*"
 		}
+		return (await this.execAndParse(null, ['dirs', path])).map((dir: any) => dir.dir)
+	}
 
-		const clInfo: any = ztagResult[0];
-		const result: DescribeResult = {
-			user: clInfo.user || '',
-			status: clInfo.status || '',
-			description: clInfo.desc || '',
-			path: clInfo.path || ztagResult[1].path,
-			date: clInfo.time ? new Date(clInfo.time * 1000) : null,
-			entries: []
-		};
-
-		for (const obj of readObjectListFromZtagOutput(ztagResult[ztagResult.length === 2 ? 1 : 0], ['depotFile', 'action', 'rev', 'type'], this.logger)) {
-			let rev = -1;
-			if (obj.rev) {
-				const num = parseInt(obj.rev);
-				if (!isNaN(num)) {
-					rev = num;
-				}
+	async files(path: string, maxFiles?: number) {
+		const args = ['files',
+			...(maxFiles ? ['-m', maxFiles.toString()] : []),
+			path]
+		try {
+			return await this.execAndParse(null, args);
+		}
+		catch (reason) {
+			if (!isExecP4Error(reason)) {
+				throw reason
 			}
-			result.entries.push({
-				depotFile: obj.depotFile || '',
-				action: obj.action || '',
-				rev,
-				type: obj.type || ''
-			});
+
+			let [_, output] = reason
+			// If perforce doesn't detect revisions in the given range, return an empty set of revisions
+			if (output.trim().endsWith("no such file(s).")) {
+				return []
+			}
+			throw reason		
 		}
-		return result;
+	}
+
+	sizes(path: string, summary?: boolean) {
+		const args = ['sizes',
+			...(summary ? ['-s'] : []),
+			path]
+		return this.execAndParse(null, args);
 	}
 
 	// update the fields on an existing CL using p4 change
@@ -1385,7 +1856,7 @@ export class PerforceContext {
 		opts = opts || {}; // optional newWorkspace:string and/or changeSubmitted:boolean
 		// get the current changelist description
 		let form = await this._execP4(workspace, ['change', '-o', changelist.toString()],
-			{edgeServerAddress: opts.edgeServerAddress});
+			{serverAddress: opts.edgeServerAddress});
 
 		if (opts.newOwner) {
 			form = form.replace(/\nUser:\t[^\n]*\n/, `\nUser:\t${opts.newOwner}\n`);
@@ -1404,7 +1875,7 @@ export class PerforceContext {
 		this.logger.info(`Executing: 'p4 change -i ${changeFlag}' to edit CL ${changelist}`);
 
 		await this._execP4(workspace, ['change', '-i', changeFlag],
-				{ stdin: form, quiet: true, edgeServerAddress: opts.edgeServerAddress })
+				{ stdin: form, quiet: true, serverAddress: opts.edgeServerAddress })
 	}
 
 	// change the description on an existing CL
@@ -1422,8 +1893,11 @@ export class PerforceContext {
 		await this.editChange(roboWorkspace, changelist, opts)
 	}
 
-	where(roboWorkspace: RoboWorkspace, clientPath: string) {
-		return this._execP4Ztag(roboWorkspace, ['where', clientPath])
+	where(roboWorkspace: RoboWorkspace, clientPath: string|string[]) {
+		if (typeof clientPath === "string") {
+			clientPath = [clientPath]
+		}
+		return this.execAndParse(roboWorkspace, ['where', ...clientPath], {quiet: !PerforceContext.devMode})
 	}
 
 	async filelog(roboWorkspace: RoboWorkspace, depotPath: string, beginRev: string, endRev: string, longOutput = false) {
@@ -1434,7 +1908,7 @@ export class PerforceContext {
 		args.push(`${depotPath}#${beginRev},${endRev}`)
 
 		try {
-			return await this._execP4Ztag(roboWorkspace, args, { multiline: longOutput })
+			return await this.execAndParse(roboWorkspace, args, {quiet:true})
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1451,9 +1925,14 @@ export class PerforceContext {
 		}
 	}
 
-	async fstat(roboWorkspace: RoboWorkspace, depotPath: string) {
+	async hasDiff(roboWorkspace: RoboWorkspace, depotPath: string) {
+		const result = await this._execP4(roboWorkspace, ['diff', '-sr', depotPath], {quiet:true})
+		return result.length == 0
+	}
+
+	async fstat(roboWorkspace: RoboWorkspace, depotPath: string, quiet?: boolean) {
 		try {
-			return await this._execP4Ztag(roboWorkspace, ['fstat', depotPath])
+			return await this.execAndParse(roboWorkspace, ['fstat', depotPath], {quiet})
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1483,7 +1962,7 @@ export class PerforceContext {
 		args.push(depotPath)
 
 		try {
-			return await this._execP4Ztag(roboWorkspace, args)
+			return await this.execAndParse(roboWorkspace, args, {quiet: opts?.quiet})
 		}
 		catch (reason) {
 			if (!isExecP4Error(reason)) {
@@ -1492,15 +1971,20 @@ export class PerforceContext {
 
 			let [err, output] = reason
 			// If perforce doesn't detect revisions in the given range, return an empty set of revisions
-			if (output.includes("no file(s) integrated.")) {
+			if (output.includes("no file(s) integrated.") || output.includes("no permission for operation on file(s).")) {
 				return []
 			}
 			throw err
 		}
 	}
 
-	print(path: string) {
-		return this._execP4(null, ['print', '-q', path], { noCwd: true, quiet: true })
+	print(path: string, outputPath?: string) {
+		let args = ['print', '-q']
+		if (outputPath) {
+			args.push('-o', outputPath)
+		}
+		args.push(path)
+		return this._execP4(null, args, { noCwd: true, quiet: true })
 	}
 
 	private _sanitizeDescription(description: string) {
@@ -1519,6 +2003,25 @@ export class PerforceContext {
 	}
 
 	// execute a perforce command
+	static _getP4Cmd(roboWorkspace: RoboWorkspace, args: string[], optsIn?: ExecOpts) {
+		const workspace = coercePerforceWorkspace(roboWorkspace);
+		// add the client explicitly if one is set (should be done at call time)
+
+		const opts = optsIn || {}
+
+		if (workspace && workspace.name) {
+			args = ['-c', workspace.name, ...args]
+		}
+
+		if (opts.serverAddress) {
+			args = ['-p', opts.serverAddress, ...args]
+		}
+
+		args = ['-zprog=robomerge', '-zversion=' + robomergeVersion, ...args]
+
+		return args
+	}
+
 	static _execP4(logger: ContextualLogger, roboWorkspace: RoboWorkspace, args: string[], optsIn?: ExecOpts) {
 		// We have some special behavior regarding Robomerge being in verbose mode (able to be set through the IPC) --
 		// basically 'debug' is for local development and these messages are really spammy
@@ -1532,23 +2035,10 @@ export class PerforceContext {
 
 		const opts = optsIn || {}
 
-		// Perforce can get mighty confused if you log into multiple accounts at any point (only relevant to local debugging)
-		if (!opts.noUsername) {
-			args = ['-u', getPerforceUsername(), ...args]
-		}
-
-		if (workspace && workspace.name) {
-			args = ['-c', workspace.name, ...args]
-		}
-
-		if (opts.edgeServerAddress) {
-			args = ['-p', opts.edgeServerAddress, ...args]
-		}
-
-		args = ['-zprog=robomerge', '-zversion=' + robomergeVersion, ...args]
+		args = PerforceContext._getP4Cmd(roboWorkspace, args, optsIn)
 
 		// log what we're running
-		let cmd_rec = new CommandRecord('p4 ' + args.join(' '));
+		let cmd_rec = new CommandRecord(logger, 'p4 ' + args.join(' '));
 		// 	logger.verbose("Executing: " + cmd_rec.cmd);
 		runningPerforceCommands.add(cmd_rec);
 
@@ -1588,7 +2078,6 @@ export class PerforceContext {
 						fail([new Error(errstr), stderr.toString().replace(newline_rex, '\n')]);
 					}
 					else if (err) {
-						logger.printException(err)
 						let errstr = "P4 Error: " + cmd_rec.cmd + "\n" + err.toString() + "\n";
 
 						if (stdout || stderr) {
@@ -1684,33 +2173,181 @@ export class PerforceContext {
 	}
 
 	private _execP4(roboWorkspace: RoboWorkspace, args: string[], optsIn?: ExecOpts) {
-		return PerforceContext._execP4(this.logger, roboWorkspace, args, optsIn)
+		optsIn = optsIn || {}
+		optsIn.serverAddress = optsIn.serverAddress || this._serverConfig.serverAddress
+		return PerforceContext._execP4(this.logger, roboWorkspace, ['-u', this.username, ...args], optsIn)
 	}
 
 	static async _execP4Ztag(logger: ContextualLogger, roboWorkspace: RoboWorkspace, args: string[], opts?: ExecZtagOpts) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		return parseZTag(await PerforceContext._execP4(logger, workspace, ['-ztag', ...args], opts), opts);
+		if (opts && opts.format) {
+			return PerforceContext._execP4(logger, roboWorkspace, ['-ztag', '-F', opts.format, ...args], opts)
+		}
+		else {
+			return parseZTag(await PerforceContext._execP4(logger, roboWorkspace, ['-ztag', ...args], opts), opts);
+		}
 	}
 
 	private async _execP4Ztag(roboWorkspace: RoboWorkspace, args: string[], opts?: ExecZtagOpts) {
-		return PerforceContext._execP4Ztag(this.logger, roboWorkspace, args, opts)
+		opts = opts || {}
+		opts.serverAddress = opts.serverAddress || this._serverConfig.serverAddress
+		return PerforceContext._execP4Ztag(this.logger, roboWorkspace, ['-u', this.username, ...args], opts)
 	}
 
-
-	////////////
-	// new -ztag parsing - use with care. Initially using for p4.changes and p4.describe
-
-	async execAndParse(roboWorkspace: RoboWorkspace, args: string[], opts: ExecOpts, options?: ztag.ParseOptions) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		const rawOutput = await PerforceContext._execP4(this.logger, workspace, ['-ztag', ...args], opts)
-		return ztag.parseZtagOutput(rawOutput, this.logger, options)
-
+	static parseValue(key: string, value: any, parseOptions?: ParseOptions)
+	{
+		if (parseOptions) {
+			const optionalType = parseOptions.optional && parseOptions.optional[key]
+			const fieldType = optionalType || (parseOptions.expected && parseOptions.expected[key]) || 'string'
+			if (fieldType === 'boolean') {
+				if (!optionalType || value) {
+					const valLower = value.toLowerCase()
+					if (valLower !== 'true' && valLower !== 'false') {
+						throw new Error(`Failed to parse boolean field ${key}, value: ${value}`)
+					}
+					return valLower === 'true'
+				}
+				return undefined
+			}
+			else if (fieldType === 'integer') {
+				// ignore empty strings for optional fields (e.g. p4.changes can return a 'shelved' property with no value)
+				if (!optionalType || value) {
+					const num = parseInt(value)
+					if (isNaN(num)) {
+						throw new Error(`Failed to parse number field ${key}, value: ${value}`)
+					}
+					return num
+				}
+				return undefined
+			}
+		}
+		return value		
 	}
 
-	async execAndParseArray(roboWorkspace: RoboWorkspace, args: string[], opts: ExecOpts, headerOptions?: ztag.ParseOptions, arrayEntryOptions?: ztag.ParseOptions) {
-		const workspace = coercePerforceWorkspace(roboWorkspace);
-		const rawOutput = await PerforceContext._execP4(this.logger, workspace, ['-ztag', ...args], opts)
-		return ztag.parseHeaderAndArray(rawOutput, this.logger, headerOptions, arrayEntryOptions)
+	static async execAndParse(logger: ContextualLogger, roboWorkspace: RoboWorkspace, args: string[], execOptions?: ExecOpts, parseOptions?: ParseOptions) {
+
+		args = ['-ztag', '-Mj', ...args]
+		let rawResult = await PerforceContext._execP4(logger, roboWorkspace, args, execOptions)
+
+		let result = []
+		let startIndex = 0;
+
+		let reviver = (key: string, value: any) => {
+			return PerforceContext.parseValue(key, value, parseOptions)
+		}
+
+		while(startIndex < rawResult.length) {
+			const endIndex = rawResult.indexOf('}\n', startIndex)
+			const parsedResult = JSON.parse(rawResult.slice(startIndex, endIndex != -1 ? endIndex+1 : undefined), reviver)
+			for (const expected in ((parseOptions && parseOptions.expected) || []))
+			{
+				if (!parsedResult[expected])
+				{
+					throw new Error(`Expected field ${expected} not present in ${JSON.stringify(parsedResult)}`)
+				}
+			}
+			result.push(parsedResult)
+			startIndex = endIndex + 2
+		}
+
+		let error = result
+						.filter((r) => Object.hasOwn(r,'data') && (Object.hasOwn(r,'generic') && Object.hasOwn(r,'severity')) || (Object.hasOwn(r,'level')))
+						.map((r) => r.data)
+						.join('')
+
+		if (error.length > 0) {
+			const cmd = `p4 ${PerforceContext._getP4Cmd(roboWorkspace, args, execOptions).join(' ')}`
+			throw [new Error(`P4 Error: ${cmd}\n${error}`), error.replace(newline_rex, '\n')]
+		}
+
+		return result
+	}
+
+	async execAndParse(roboWorkspace: RoboWorkspace, args: string[], execOptions?: ExecOpts, parseOptions?: ParseOptions) {
+		execOptions = execOptions || {}
+		execOptions.serverAddress = execOptions.serverAddress || this._serverConfig.serverAddress
+		return PerforceContext.execAndParse(this.logger, roboWorkspace, ['-u', this.username, ...args], execOptions, parseOptions)
+	}
+
+	static async execAndParseArray(logger: ContextualLogger, roboWorkspace: RoboWorkspace, args: string[], execOptions?: ExecOpts, headerOptions?: ParseOptions, arrayEntryOptions?: ParseOptions) {
+
+		args = ['-ztag', '-Mj', ...args]
+		let rawResult = await PerforceContext._execP4(logger, roboWorkspace, args, execOptions)
+
+		let result = []
+		let startIndex = 0;
+
+		let reviver = (key: string, value: any) => {
+			const arrayElementMatch = key.match(/^(.*?)\d+$/)
+			if (arrayElementMatch) {
+				return this.parseValue(arrayElementMatch[1], value, arrayEntryOptions)
+			}
+			return this.parseValue(key, value, headerOptions)
+		}
+
+		while(startIndex < rawResult.length) {
+			const endIndex = rawResult.indexOf('}\n', startIndex)
+			let parsedResult = JSON.parse(rawResult.slice(startIndex, endIndex != -1 ? endIndex+1 : undefined), reviver)
+			for (let expected in headerOptions && headerOptions.expected || []) {
+				if (!parsedResult[expected])
+				{
+					throw new Error(`Expected field ${expected} not present in ${JSON.stringify(parsedResult)}`)
+				}
+			}
+			let organizedResult: {[key:string]:any} = {};
+			organizedResult.entries = []
+			let expectedCounts: number[] = []
+			for (const field in parsedResult) {
+				const arrayElementMatch = field.match(/^(.*?)(\d+)$/)
+				if (arrayElementMatch) {
+					const arrayField = arrayElementMatch[1]
+					const arrayIndex = parseInt(arrayElementMatch[2])
+					const curLength = expectedCounts.length
+					if (arrayIndex >= curLength) {
+						organizedResult.entries.length = arrayIndex+1
+						expectedCounts.length = arrayIndex+1
+						for (let i=curLength; i<organizedResult.entries.length; i++) {
+							let newEntry: {[key:string]:any} = {};
+							organizedResult.entries[i] = newEntry
+						}
+					}
+					organizedResult.entries[arrayIndex][arrayField] = parsedResult[field]
+					if (arrayEntryOptions && arrayEntryOptions.expected && arrayEntryOptions.expected[arrayField]) {
+						expectedCounts[arrayIndex] += 1
+					}
+				}
+				else {
+					organizedResult[field] = parsedResult[field]
+				}
+			}
+			if (arrayEntryOptions && arrayEntryOptions.expected) {
+				const expectedCount = Object.keys(arrayEntryOptions.expected).length
+				for (let index in expectedCounts) {
+					if (expectedCounts[index] != expectedCount) {
+						for (let expected in arrayEntryOptions.expected) {
+							if (!organizedResult.entries[index][expected])
+							{
+								throw new Error(`Expected field ${expected} not present in ${JSON.stringify(organizedResult.entries[index])}`)
+							}
+						}
+					}
+				}
+			}
+			result.push(organizedResult)
+			startIndex = endIndex + 2
+		}
+
+		if (result.length == 1 && Object.hasOwn(result[0],'data') && Object.hasOwn(result[0],'generic') && Object.hasOwn(result[0],'severity')) {
+			const cmd = `p4 ${PerforceContext._getP4Cmd(roboWorkspace, args, execOptions).join(' ')}`
+			throw [new Error(`P4 Error: ${cmd}\n${result[0]['data']}`), result[0]['data'].replace(newline_rex, '\n')]
+		}
+
+		return result
+	}
+
+	async execAndParseArray(roboWorkspace: RoboWorkspace, args: string[], execOptions?: ExecOpts, headerOptions?: ParseOptions, arrayEntryOptions?: ParseOptions) {
+		execOptions = execOptions || {}
+		execOptions.serverAddress = execOptions.serverAddress || this._serverConfig.serverAddress
+		return PerforceContext.execAndParseArray(this.logger, roboWorkspace, ['-u', this.username, ...args], execOptions, headerOptions, arrayEntryOptions)
 	}
 }
 
@@ -1718,7 +2355,6 @@ export function getRootDirectoryForBranch(name: string): string {
 	return process.platform === "win32" ? `d:/ROBO/${name}` : `/src/${name}`;
 }
 
-// temp (ha)
 export function coercePerforceWorkspace(workspace: any): Workspace | null {
 	if (!workspace)
 		return null

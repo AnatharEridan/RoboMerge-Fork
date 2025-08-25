@@ -1,22 +1,21 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-import * as fs from 'fs';
 import { DateTimeFormatOptions } from 'intl';
 import { Args } from '../common/args';
 import { Badge } from '../common/badge';
-import { Random } from '../common/helper';
+import { Random, setDefault } from '../common/helper';
 import { ContextualLogger } from '../common/logger';
-import { Blockage, Branch, BranchArg, ExclusiveLockInfo, ForcedCl, MergeAction, NodeOpUrlGenerator, resolveBranchArg } from './branch-interfaces';
+import { ExclusiveFileDetails } from '../common/perforce';
+import { Blockage, Branch, BranchArg,  ExclusiveLockInfo, ForcedCl, MergeAction, NodeOpUrlGenerator, resolveBranchArg } from './branch-interfaces';
 import { PersistentConflict, Resolution } from './conflict-interfaces';
 import { BotEventHandler, BotEvents } from './events';
 import { NodeBot } from './nodebot';
 import { BlockageNodeOpUrls } from './roboserver';
 import { Context } from './settings';
-import { Slack, SlackAttachment, SlackLinkButtonAction, SlackLinkButtonsAttachment, SlackMessageField, SlackMessage, SlackMessageStyles } from './slack';
+import { Slack, SlackAttachment, SlackFile, SlackLinkButtonAction, SlackLinkButtonsAttachment, SlackMessageField, SlackMessage, SlackMessageStyles } from './slack';
+import { Vault } from './vault'
 import { WebServer } from '../common/webserver'
 import { DummySlackApp } from '../common/dummyslackserver'
-
-const notificationsStartupLogger = new ContextualLogger('Notifications Startup')
 
 export const NOTIFICATIONS_PERSISTENCE_KEY = 'notifications'
 export const SLACK_MESSAGES_PERSISTENCE_KEY = 'slackMessages'
@@ -32,7 +31,7 @@ let SLACK_TOKENS: {[name: string]: string} = {}
 const SLACK_DEV_DUMMY_TOKEN = 'dev'
 
 let args: Args
-export function notificationsInit(inArgs: Args) {
+export function notificationsInit(inArgs: Args, vault: Vault) {
 	
 	args = inArgs
 
@@ -47,18 +46,7 @@ export function notificationsInit(inArgs: Args) {
 		return
 	}
 
-	let vault
-	try {
-		const vaultString = fs.readFileSync(args.vault + '/vault.json', 'ascii')
-		vault = JSON.parse(vaultString)
-	}
-	catch (err) {
-		const errStr = err.toString().replace(/(E|e)(R|r)(R|r)(O|o)(R|r)/,"$1$2$30$5")
-		notificationsStartupLogger.warn(`Warning, failed to find Slack secrets in vault (ok in dev): ${errStr}`)
-		return
-	}
-
-	const tokensObj = vault['slack-tokens']
+	const tokensObj = vault.slackTokens
 	if (tokensObj) {
 		SLACK_TOKENS = tokensObj
 	}
@@ -90,10 +78,23 @@ export async function postMessageToChannel(message: string, channel: string, sty
 //////////
 // Utils
 
-// make a Slack notifcation link for a user
+// make a Slack notification link for a user
 function atifyUser(user: string) {
 	// don't @ names of bots (currently making them tt style for Slack)
-	return isUserAKnownBot(user) ? `\`${user}\`` : user.startsWith('@') ? user : '@' + user
+	return isUserAKnownBot(user) ? `\`${user}\`` : isUserSlackGroup(user) ? user : '@' + user
+}
+
+export function isUserSlackGroup(user: string) {
+	return user.startsWith('@') || user.startsWith('<')
+}
+
+export async function getPingTarget(userEmail: string|null, owner: string, slackMessages: SlackMessages) {
+	const slackUser = userEmail ? await slackMessages.getSlackUser(userEmail) : null
+	return slackUser 
+	? `<@${slackUser}>` 
+	: isUserSlackGroup(owner)
+		? owner 
+		: `@${owner}`
 }
 
 function generatePersistedSlackMessageKey(sourceCl: number, targetBranchArg: BranchArg, channel: string) {
@@ -206,6 +207,7 @@ function formatResolution(info: PersistentConflict) {
 
 type SlackConflictMessage = {
 	timestamp: string
+	permalink: string
 	messageOpts: SlackMessage
 }
 
@@ -246,6 +248,8 @@ export class SlackMessages {
 			}
 			findResult.messageRecord.messageOpts = message
 			await this.update(findResult.messageRecord, findResult.persistedMessages)
+
+			return findResult.messageRecord.permalink
 		}
 		// Otherwise, we will need to create a new one
 		else {
@@ -254,8 +258,10 @@ export class SlackMessages {
 			message.cl = cl
 
 			let timestamp
+			let permalink
 			try {
 				timestamp = await this.slack.postMessage(message)
+				permalink = await this.slack.getPermalink(timestamp, message.channel)
 			}
 			catch (err) {
 				this.smLogger.printException(err, 'Error talking to Slack')
@@ -264,9 +270,11 @@ export class SlackMessages {
 
 			// Used for messages we don't care to keep, currently the /api/test/directmessage endpoint
 			if (persistMessage) {
-				findResult.persistedMessages[findResult.conflictKey] = {timestamp, messageOpts: message}
+				findResult.persistedMessages[findResult.conflictKey] = {timestamp, permalink, messageOpts: message}
 				this.persistence.set(SLACK_MESSAGES_PERSISTENCE_KEY, findResult.persistedMessages)
 			}
+
+			return permalink
 		}
 	}
 
@@ -287,14 +295,32 @@ export class SlackMessages {
 		}
 	}
 
-	async postDM(emailAddress: string|Promise<string|null>|null, cl: number, branchArg: BranchArg, dm: SlackMessage, persistMessage = true) {
+	async postFile(cl: number, branchArg: BranchArg, file: SlackFile) {
+		const findResult = this.find(cl, branchArg, file.channels)
+
+		if (findResult.messageRecord) {
+			try {
+				file.thread_ts = findResult.messageRecord.timestamp
+				await this.slack.uploadFile(file)
+			}
+			catch (err) {
+				console.error('Error uploading file to Slack! ' + err.toString())
+				return
+			}
+		}
+		else {
+			this.smLogger.error(`Failed to find message record for ${cl}:${branchArg}:${file.channels}`)
+		}
+	}
+
+	private async getDMChannelId(emailAddress: string|Promise<string|null>|null, cl: number) {
 		// The Slack API requires a user ID to open a direct message with users.
 		// The most consistent way to do this is getting their email address out of P4.
 		if (emailAddress && typeof(emailAddress) !== 'string') {
 			emailAddress = await emailAddress
 		}
 		if (!emailAddress) {
-			console.error("Failed to get email address during notifications for CL " + cl)
+			this.smLogger.error("Failed to get email address during notifications for CL " + cl)
 			return
 		}
 
@@ -307,18 +333,34 @@ export class SlackMessages {
 		}
 
 		// Open up a new conversation with the user now that we have their ID
-		let channelId : string
 		try {
-			channelId = (await this.slack.openDMConversation(userId))
-			dm.channel = channelId
+			return this.slack.openDMConversation(userId)
 		} catch (err) {
 			this.smLogger.printException(err, `Failed to get Slack conversation ID for user ID "${userId}" given email address "${emailAddress}" for CL ${cl}`)
-			return
 		}
 
-		// Add the channel/conversation ID to the messageOpts and proceed normally.
-		this.smLogger.info(`Creating direct message for ${emailAddress} (key: ${generatePersistedSlackMessageKey(cl, branchArg, channelId)})`)
-		this.postOrUpdate(cl, branchArg, dm, persistMessage)
+		return
+	}
+
+	async postDM(emailAddress: string|Promise<string|null>|null, cl: number, branchArg: BranchArg, dm: SlackMessage, persistMessage = true) {
+
+		const channelId = await this.getDMChannelId(emailAddress, cl)
+		if (channelId) {
+			dm.channel = channelId
+			// Add the channel/conversation ID to the messageOpts and proceed normally.
+			this.smLogger.info(`Creating direct message for ${emailAddress} (key: ${generatePersistedSlackMessageKey(cl, branchArg, channelId)})`)
+			this.postOrUpdate(cl, branchArg, dm, persistMessage)
+		}
+	}
+
+	async postFileToDM(emailAddress: string|Promise<string|null>|null, cl: number, branchArg: BranchArg, file: SlackFile) {
+
+		const channelId = await this.getDMChannelId(emailAddress, cl)
+		if (!channelId) {
+			return
+		}
+		file.channels = channelId
+		this.postFile(cl, branchArg, file)
 	}
 
 	// 
@@ -377,7 +419,7 @@ export class SlackMessages {
 							/* this is expected and fine */ 
 						}
 						else {
-							const errorMsg = `Error inviting ${emailAddress} (${user}) to channel <#${channel}>: ${result.error}\n${result.failed_user_ids}`
+							const errorMsg = `Error inviting ${emailAddress} (${user}) to channel <#${channel}>: ${result.error}\n${JSON.stringify(result.failed_user_ids)}`
 							this.smLogger.error(errorMsg)
 							postToRobomergeAlerts(errorMsg)
 						}
@@ -385,7 +427,12 @@ export class SlackMessages {
 					else if (result.error === "user_is_restricted") {
 						// This an external user so we need to use the admin invite and validate that the channel ends in -ext
 						const channelInfo = await this.slack.getChannelInfo(channel)
-						if (channelInfo.channel.name.endsWith('-ext')) {
+						if (!channelInfo.channel) {
+							const errorMsg = `Failed to get name of channel ${channel} when inviting user ${emailAddress} (${user})`
+							this.smLogger.error(errorMsg)
+							postToRobomergeAlerts(errorMsg)
+						}
+						else if (channelInfo.channel.name.endsWith('-ext')) {
 							await this.addUserToChannel(emailAddress, channel, true)
 						}
 						else {
@@ -470,7 +517,7 @@ export class BotNotifications implements BotEventHandler {
 	/** Conflict */
 	// considered if no Slack set up, should continue to add people to notify, but too complicated:
 	//		let's go all in on Slack. Fine for this to be async (but fire and forget)
-	async onBlockage(blockage: Blockage) {
+	async onBlockage(blockage: Blockage, isNew: boolean) {
 		const changeInfo = blockage.change
 
 		if (changeInfo.userRequest) {
@@ -486,8 +533,6 @@ export class BotNotifications implements BotEventHandler {
 			return
 		}
 
-		const cl = blockage.approval ? blockage.approval.shelfCl : changeInfo.cl
-
 		// or integration failure (better wording? exclusive check-out?)
 		const sourceBranch = changeInfo.branch
 		let targetBranch
@@ -497,28 +542,26 @@ export class BotNotifications implements BotEventHandler {
 		const issue = blockage.failure.kind.toLowerCase()
 
 		const userEmail = await blockage.ownerEmail
-		const slackUser = userEmail ? await this.slackMessages.getSlackUser(userEmail) : null
-		const channelPing = slackUser ? `<@${slackUser}>` : blockage.owner.startsWith('@') ? blockage.owner : `@${blockage.owner}`
+		const channelPing = await getPingTarget(userEmail, blockage.owner, this.slackMessages)
 
 		const isBotUser = isUserAKnownBot(blockage.owner)
 		const text =
-			blockage.approval ?				`${channelPing}'s change needs to be approved in <#${blockage.approval.settings.channelId}>` :
+			blockage.approval ?				`${channelPing}'s change needs to be approved\n\n${blockage.approval.settings.description}` :
 			isBotUser ? 									`Blockage caused by \`${blockage.owner}\` commit!` :
-			blockage.failure.kind === 'Too many files' ?	`${channelPing}, please request a shelf for this large changelist` :
 															`${channelPing}, please resolve the following ${issue}:`
 
-		const message = this.makeSlackChannelMessage(
+		let message = this.makeSlackChannelMessage(
 			`${sourceBranch.name} blocked! (${issue})`,
 			text,
 			SlackMessageStyles.DANGER, 
-			makeClLink(cl), 
+			makeClLink(changeInfo.cl), 
 			sourceBranch, 
 			targetBranch, 
 			changeInfo.author
 		);
 
-		if (blockage.failure.summary) {
-			message.footer = blockage.failure.summary
+		if (blockage.approval) {
+			message.fields?.push({title: 'Shelved Change', short: true, value: makeClLink(blockage.approval.shelfCl)})
 		}
 
 		let messagesToPost = []
@@ -544,38 +587,60 @@ export class BotNotifications implements BotEventHandler {
 
 			messagesToPost.push({ message })
 
-			if (blockage.failure.kind === 'Exclusive check-out') {
-				const exclusiveLockUsers = (blockage.failure.additionalInfo as ExclusiveLockInfo).exclusiveLockUsers
-				let text = ''
+			if (isNew && blockage.failure.details) {
+				let file: SlackFile = {
+					content: blockage.failure.details,
+					channels: message.channel,
+					filename: "conflictdetails.txt"
+				}
+				messagesToPost.push({file})
+			}
 
-				for (const exclusiveLockUser of exclusiveLockUsers) {
-					let exclusiveLockSlackUser
-					const exclusiveLockUserEmail = await exclusiveLockUser.userEmail
-					if (exclusiveLockUserEmail) {
-						exclusiveLockSlackUser = await this.slackMessages.getSlackUser(exclusiveLockUserEmail)
-						if (exclusiveLockSlackUser) {
-							exclusiveLockSlackUser = `<@${exclusiveLockSlackUser}> `
+			if (isNew && blockage.failure.kind === 'Exclusive check-out') {
+				const exclusiveLockInfo = blockage.failure.additionalInfo as ExclusiveLockInfo
+
+				let authorDict = new Map<string, ExclusiveFileDetails[]>()
+				for (const file of exclusiveLockInfo.exclusiveFiles) {
+					setDefault(authorDict, file.user.toLowerCase(), []).push(file)
+				}
+
+				for (const exclusiveLockUser of exclusiveLockInfo.exclusiveLockUsers) {
+					let file: SlackFile = { 
+						content: authorDict.get(exclusiveLockUser.user)!.map(ef => ef.depotPath).join("\n"),
+						channels: message.channel,
+						filename: "exclusivelockedfiles.txt"
+					}
+					if (exclusiveLockUser.user.length > 0) {
+						let exclusiveLockSlackUser
+						const exclusiveLockUserEmail = await exclusiveLockUser.userEmail
+						if (exclusiveLockUserEmail) {
+							exclusiveLockSlackUser = await this.slackMessages.getSlackUser(exclusiveLockUserEmail)
+							if (exclusiveLockSlackUser) {
+								exclusiveLockSlackUser = `<@${exclusiveLockSlackUser}> `
+							}
+							usersToInvite.add(exclusiveLockUserEmail)
 						}
-						usersToInvite.add(exclusiveLockUserEmail)
+						if (!exclusiveLockSlackUser) {
+							exclusiveLockSlackUser = `@${exclusiveLockUser.user} `
+						}
+						file.initial_comment = `${exclusiveLockSlackUser} please unlock the files blocking robomerge or work with ${blockage.owner} to resolve the conflict. Hit retry on the blocked stream once the files are unlocked.`
+					} else {
+						file.initial_comment = "The following locked files did not have their owner determined and as such those owners may not have been notified"
 					}
-					if (!exclusiveLockSlackUser) {
-						exclusiveLockSlackUser = `@${exclusiveLockUser.user} `
-					}
-					text += exclusiveLockSlackUser
+					messagesToPost.push({file})
 				}
-				text += `\n\nPlease unlock the files blocking robomerge or work with ${blockage.owner} to resolve the conflict`
-				
-				const exclusiveCheckoutMessage: SlackMessage = {
-					text,
-					style: SlackMessageStyles.DANGER,
-					channel: message.channel,
-					mrkdwn: true
-				}
-				messagesToPost.push({ message: exclusiveCheckoutMessage, reply: true})
 			}
 		}
 		else {
-			channelsToPostTo.push(message.channel)
+			if (sourceBranch.config.additionalSlackChannelForBlockages) {
+				if (!sourceBranch.config.postMessagesToAdditionalChannelOnly) {
+					channelsToPostTo.push(message.channel)
+				}
+				channelsToPostTo.push(sourceBranch.config.additionalSlackChannelForBlockages)
+			}
+			else {
+				channelsToPostTo.push(message.channel)
+			}
 			messagesToPost.push({ message })
 
 			const syntaxErrorMessage: SlackMessage = {
@@ -587,17 +652,22 @@ export class BotNotifications implements BotEventHandler {
 			messagesToPost.push({ message: syntaxErrorMessage, reply: true})		
 		}
 
+		let threadLinks = []
+
 		const branchArg = targetBranch ? targetBranch.name : blockage.failure.kind
 		for (const channel of channelsToPostTo) {
 			for (const user of usersToInvite) {
 				this.slackMessages.addUserToChannel(user, channel)
 			}
 			for (const messageToPost of messagesToPost) {
-				if (messageToPost.reply) {
+				if (messageToPost.file) {
+					await this.slackMessages.postFile(changeInfo.cl, branchArg, { ...messageToPost.file, channels: channel})
+				}
+				else if (messageToPost.reply) {
 					await this.slackMessages.postReply(changeInfo.cl, branchArg, { ...messageToPost.message, channel })
 				}
 				else {
-					await this.slackMessages.postOrUpdate(changeInfo.cl, branchArg, { ...messageToPost.message, channel })
+					threadLinks.push(await this.slackMessages.postOrUpdate(changeInfo.cl, branchArg, { ...messageToPost.message, channel }))
 				}
 			}
 		}
@@ -608,7 +678,7 @@ export class BotNotifications implements BotEventHandler {
 			if (blockage.approval) {
 				dm = {
 					title: 'Approval needed to commit to ' + targetBranch.name,
-					text: `Your change has been shelved in ${makeClLink(cl)} and sent to <#${blockage.approval.settings.channelId}> for approval\n\n` +
+					text: `Your change has been shelved in ${makeClLink(blockage.approval.shelfCl)} and sent to <#${blockage.approval.settings.channelId}> for approval\n\n` +
 							blockage.approval.settings.description,
 					channel: "",
 					mrkdwn: true
@@ -618,7 +688,7 @@ export class BotNotifications implements BotEventHandler {
 				const dmText = `Your change (${makeClLink(changeInfo.source_cl)}) ` +
 					`hit '${issue}' while merging from *${sourceBranch.name}* to *${targetBranch.name}*.\n\n` +
 					'`' + blockage.change.description.substring(0, 80) + '`\n\n' +
-					"*_Resolving this blockage is time sensitive._ Please select one of the following:*"
+					"*_Resolving this blockage is time sensitive._*"
 				
 				const urls = this.blockageUrlGenerator(blockage)
 				if (!urls) {
@@ -627,7 +697,7 @@ export class BotNotifications implements BotEventHandler {
 					throw error
 				}
 
-				dm = this.makeSlackDirectMessage(dmText, changeInfo.cl, cl, targetBranch.name, urls)
+				dm = this.makeSlackDirectMessage(dmText, changeInfo.cl, changeInfo.cl, targetBranch.name, urls, threadLinks)
 			}
 
 			this.slackMessages.postDM(userEmail, changeInfo.cl, targetBranch, dm)
@@ -687,19 +757,34 @@ export class BotNotifications implements BotEventHandler {
 
 	onNonSkipLastClChange(details: ForcedCl) {
 		if (this.slackMessages) {
-			this.slackMessages.postNonConflictMessage({
-				title: details.nodeOrEdgeName + ' forced to new CL',
-				text: details.reason,
-				style: SlackMessageStyles.WARNING,
-				fields: [{
-					title: 'By', short: true, value: details.culprit
-				}, {
-					title: 'Changelists', short: true, value: `${makeClLink(details.previousCl)} -> ${makeClLink(details.forcedCl)}`
-				}],
-				title_link: this.externalRobomergeUrl + '#' + this.botname,
-				mrkdwn: true,
-				channel: this.slackChannel // Default to the configured channel
-			}) 
+			let channelsToPostTo = []		
+			const additionalChannelInfo = this.additionalBlockChannelIds.get(details.sourceBranchUpperName + '|' + details.targetBranchUpperName)
+			if (additionalChannelInfo) {
+				const [sideChannel, postOnlyToSideChannel] = additionalChannelInfo
+				if (!postOnlyToSideChannel) {
+					channelsToPostTo.push(this.slackChannel)
+				}
+				channelsToPostTo.push(sideChannel)
+			}
+			else {
+				channelsToPostTo.push(this.slackChannel)
+			}
+
+			for (let slackChannel of channelsToPostTo) {
+				this.slackMessages.postNonConflictMessage({
+					title: details.nodeOrEdgeName + ' forced to new CL',
+					text: details.reason,
+					style: SlackMessageStyles.WARNING,
+					fields: [{
+						title: 'By', short: true, value: details.culprit
+					}, {
+						title: 'Changelists', short: true, value: `${makeClLink(details.previousCl)} -> ${makeClLink(details.forcedCl)}`
+					}],
+					title_link: this.externalRobomergeUrl + '#' + this.botname,
+					mrkdwn: true,
+					channel: slackChannel // Default to the configured channel
+				}) 
+			}
 		}
 	}
 
@@ -780,10 +865,37 @@ export class BotNotifications implements BotEventHandler {
 
 	// This is an extremely opinionated function to send a stylized direct message to the end user.
 	//makeSlackChannelMessageOpts(title: string, style: string, clDesc: string, sourceBranch: BranchArg,targetBranch?: BranchArg, author?: string, buttons?: SlackLinkButtonsAttachment[]) 
-	private makeSlackDirectMessage(messageText: string, sourceCl: number, conflictCl: number, targetBranch: string, conflictUrls: BlockageNodeOpUrls) : SlackMessage {
+	private makeSlackDirectMessage(messageText: string, sourceCl: number, conflictCl: number, targetBranch: string, conflictUrls: BlockageNodeOpUrls, threadLinks?: string[]) : SlackMessage {
 		// Start collecting our attachments
 		let attachCollection : SlackAttachment[] = []
 		
+		// General information
+		attachCollection.push({
+			text: `To learn more about robomerge and how to resolve blockages, please review the <${this.externalRobomergeUrl}/help|robomerge help page>.`,
+			mrkdwn_in: ["text"]
+		})
+
+		threadLinks = (threadLinks || []).filter(threadLink => threadLink)
+		if (threadLinks.length > 0) {
+			let text = `Discussion for this issue can be found in the following thread${threadLinks.length > 1 ? 's' : ''}:`
+			for (const threadLink of threadLinks) {
+				text += `\n${threadLink}`
+			}
+			attachCollection.push({
+				text,
+				mrkdwn_in: ["text"]
+			})
+		}
+
+		attachCollection.push({
+			text: "You can also get help via the robomerge Slack channel: <#C9321FLTU>",
+			mrkdwn_in: ["text"]
+		})
+		attachCollection.push({
+			text: "If you cannot login to robomerge or access the 'robomerge-help' slack channel, please contact the IT helpdesk.",
+			mrkdwn_in: ["text"]
+		})
+
 		// Acknowledge button
 		const conflictClLink = makeClLink(conflictCl, 'conflict CL #' + conflictCl)
 		attachCollection.push(<SlackLinkButtonsAttachment>{
@@ -822,12 +934,6 @@ export class BotNotifications implements BotEventHandler {
 				actions: [this.generateStompButton(`Stomp Changes in ${targetBranch}`, conflictUrls.stompUrl)]
 			})
 		}
-
-		// Append footer
-		attachCollection.push({
-			pretext: "You can get help via the Slack channel <#C044ZUNF9MJ> (if you don't have access to '#dt-robomerge-help-ext', please contact the IT helpdesk)",
-			mrkdwn_in: ["pretext"]
-		})
 
 		// Return SlackMessage for our direct message
 		return {

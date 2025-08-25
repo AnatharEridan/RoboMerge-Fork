@@ -18,14 +18,13 @@ type QueuedChange = Partial<ReconsiderArgs> & {
 
 export type FailureKind =
 	'Integration error' |
+	'Transfer error' |
 	'Exclusive check-out' |
 	'Merge conflict' |
 	'Commit failure' |
 	'Syntax error' |
 	'Disallowed files' |
-	'Too many files' |
 	'Approval required' |
-	'Conversion to edits failure' |
 	'Unit Test error'
 
 export enum AvailableTypeEnum {
@@ -88,6 +87,7 @@ export type AnyStateInfo = ManualPauseInfo | BlockagePauseInfo | AvailableInfo
 export type BotStatusFields = Partial<PauseStatusFields> & {
 	display_name: string
 	last_cl: number
+	swarmURL?: string
 
 	headCL?: number
 
@@ -114,6 +114,7 @@ export type EdgeStatusFields = BotStatusFields & {
 	disallowSkip: boolean
 	incognitoMode: boolean
 	excludeAuthors: string[]
+	excludeDescriptions: string[]
 
 	lastGoodCL?: number
 	lastGoodCLJobLink?: string
@@ -149,7 +150,6 @@ export type BranchDefForStatus = {
 	blockAssetTargets: string[]
 	bot: string
 	config: any //NodeOptions
-	convertIntegratesToEdits: boolean
 	defaultFlow: string[]
 	flowsTo: string[]
 	forceFlowTo: string[]
@@ -170,6 +170,7 @@ export type ConflictStatusFields = {
 	kind: FailureKind
 	author: string
 	owner: string
+	slackLinks: string[]
 }
 
 type GraphBotError = {

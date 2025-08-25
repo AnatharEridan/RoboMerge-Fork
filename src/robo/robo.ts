@@ -5,25 +5,27 @@ import { OnUncaughtException, OnUnhandledRejection } from '@sentry/node/dist/int
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import * as p4util from '../common/p4util';
 import { Analytics } from '../common/analytics';
 import { Arg, readProcessArgs } from '../common/args';
 import { _setTimeout } from '../common/helper';
 import { ContextualLogger } from '../common/logger';
 import { Mailer } from '../common/mailer';
-import { ClientSpec, getPerforceUsername, getRootDirectoryForBranch, initializePerforce, PerforceContext, StreamSpecs } from '../common/perforce';
+import { initializePerforce, PerforceContext } from '../common/perforce';
 import { BuildVersion, VersionReader } from '../common/version';
 import { CertFiles } from '../common/webserver';
 import { addBranchGraph, Graph, GraphAPI } from '../new/graph';
 import { AutoBranchUpdater } from './autobranchupdater';
 import { Branch } from './branch-interfaces';
+import { Gate } from './gate';
 import { GraphBot } from './graphbot';
 import { IPC, Message } from './ipc';
 import { NodeBot } from './nodebot';
 import { roboAnalytics, setGlobalAnalytics } from './roboanalytics';
 import { RoboServer } from './roboserver';
 import { notificationsInit } from './notifications'
+import { roboArgsInit } from './roboargs'
 import { settingsInit } from './settings'
+import { Vault } from './vault'
 import * as Preview from './preview'
 
 /*************************
@@ -33,9 +35,6 @@ import * as Preview from './preview'
 // Begin by intializing our logger and version reader
 const roboStartupLogger = new ContextualLogger('Robo Startup')
 VersionReader.init(roboStartupLogger)
-
-// I seem to have broken this
-const DEBUG_SKIP_BRANCH_SETUP = false;
 
 const COMMAND_LINE_ARGS: {[param: string]: Arg<any>} = {
 	botname: {
@@ -87,6 +86,18 @@ const COMMAND_LINE_ARGS: {[param: string]: Arg<any>} = {
 		dflt: './data'
 	},
 
+	gateUpdateWorkspacePrefix: {
+		match: /^-gate_update_workspace_prefix=(.+)$/,
+		env: 'ROBO_GATE_UPDATE_WORKSPACE_PREFIX',
+		dflt: 'robomerge-gateupdate-' + os.hostname()
+	},
+
+	gateUpdatesDirectory: {
+		match: /^-gate_updates_directory=(.+)$/,
+		env: 'ROBO_GATE_UPDATES_DIRECTORY',
+		dflt: './gateupdates'
+	},
+
 	noIPC: {
 		match: /^(-noIPC)$/,
 		parse: _str => true,
@@ -133,6 +144,15 @@ const COMMAND_LINE_ARGS: {[param: string]: Arg<any>} = {
 		parse: str => str === "false" ? false : true,
 		env: 'ROBO_PREVIEW_ONLY',
 		dflt: false
+	},
+
+	exclusiveLockOpenedsToRun: {
+		match: /^-exclusiveLockOpenedsToRun=([0-9]+)$/,
+		env: 'ROBO_EXCLUSIVE_LOCK_OPENEDS_TO_RUN',
+		parse: (str: string) => {
+			return parseInt(str)
+		},
+		dflt: 100
 	},
 
 	// Sentry environment designation -- use 'PROD' to enable Sentry bug tracking
@@ -201,7 +221,9 @@ if (!maybeNullArgs) {
 }
 const args = maybeNullArgs!
 
-notificationsInit(args)
+const vault = new Vault(args.vault)
+notificationsInit(args, vault)
+roboArgsInit(args)
 settingsInit(args)
 Preview.init(args.branchSpecsRootPath)
 
@@ -222,19 +244,14 @@ if (env === 'prod'
 GraphBot.dataDirectory = args.branchSpecsDirectory;
 
 export class RoboMerge {
-	private readonly roboMergeLogger = new ContextualLogger('RoboMerge')
+	readonly roboMergeLogger = new ContextualLogger('RoboMerge')
 	readonly graphBots = new Map<string, GraphBot>()
 	graph: GraphAPI
 	mailer: Mailer
 	
 	static VERSION : BuildVersion = VersionReader.getBuildVersionObj();
-	readonly p4: PerforceContext
 
 	readonly VERSION_STRING = VersionReader.toString();
-
-	constructor() {
-		this.p4 = new PerforceContext(this.roboMergeLogger)
-	}
 
 	getAllBranches() : Branch[] {
 		const branches: Branch[] = [];
@@ -256,88 +273,6 @@ export class RoboMerge {
 
 	stop() {
 		roboAnalytics!.stop()
-	}
-}
-
-async function _getExistingWorkspaces(user?: string) {
-	const existingWorkspacesObjects = await robo.p4.find_workspaces(user, {includeUnloaded: true});
-	return new Map<string, ClientSpec>(existingWorkspacesObjects.map((ws: ClientSpec) => [ws.client, ws]));
-}
-
-async function _initWorkspacesForGraphBot(graphBot: GraphBot, existingWorkspaces: Map<string, ClientSpec>, logger: ContextualLogger) {
-	// name and depot root pair
-	const workspacesToReset: [string, string][] = []
-	let reloadedWorkspaces = []
-
-	for (const branch of graphBot.branchGraph.branches) {
-		if (branch.workspace !== null) {
-			logger.info(`Using manually configured workspace ${branch.workspace} for branch ${branch.name}`);
-			continue;
-		}
-
-		// name the workspace
-		let workspaceName = branch.config.workspaceNameOverride || ['ROBOMERGE', branch.parent.botname, branch.name].join('_');
-		const p4username = getPerforceUsername()
-		if (p4username !== 'robomerge') {
-			workspaceName = [p4username!.toUpperCase(), process.platform.toUpperCase(), workspaceName].join('_')
-		}
-		branch.workspace = workspaceName.replace(/[\/\.-\s]/g, "_").replace(/_+/g,"_");
-
-		const ws = branch.workspace;
-
-		// ensure root directory exists (we set the root diretory to be the cwd)
-		const path = getRootDirectoryForBranch(ws);
-		if (!fs.existsSync(path)) {
-			logger.info(`Making directory ${path}`);
-			fs.mkdirSync(path);
-		}
-
-		// see if we already have this workspace
-		const clientSpec = existingWorkspaces.get(ws)
-		if (clientSpec && clientSpec.Stream === branch.stream) {
-			if (clientSpec.IsUnloaded) {
-				reloadedWorkspaces.push(robo.p4.reloadWorkspace(ws))
-			}
-			workspacesToReset.push([ws, branch.rootPath])
-		}
-		else {
-			const params: any = {};
-			if (branch.stream) {
-				params['Stream'] = branch.stream;
-			}
-			else {
-				params['View'] = [
-					`${branch.rootPath} //${ws}/...`
-				];
-			}
-
-			await robo.p4.newGraphBotWorkspace(ws, params);
-
-			// if we're on linux, remove the directory whenever we create the workspace for the first time
-			if (process.platform === "linux") {
-				const dir = '/src/' + branch.workspace;
-				logger.info(`Cleaning ${dir}...`);
-
-				// delete the directory contents (but not the directory)
-				require('child_process').execSync(`rm -rf ${dir}/*`);
-			}
-			else {
-				await robo.p4.clean(branch.workspace);
-			}
-		}
-	}
-
-	await Promise.all(reloadedWorkspaces)
-	if (workspacesToReset.length > 0) {
-		logger.info('The following workspaces already exist and will be reset: ' + workspacesToReset.join(', '))
-		await p4util.cleanWorkspaces(robo.p4, workspacesToReset)
-	}
-}
-
-async function _initBranchWorkspacesForAllBots(logger: ContextualLogger) {
-	const existingWorkspaces = await _getExistingWorkspaces();
-	for (const graphBot of robo.graphBots.values()) {
-		await _initWorkspacesForGraphBot(graphBot, existingWorkspaces, logger);
 	}
 }
 
@@ -374,7 +309,6 @@ let specReloadEntryCount = 0
 async function _onBranchSpecReloaded(graphBot: GraphBot, logger: ContextualLogger) {
 	try {
 		++specReloadEntryCount
-		await _initWorkspacesForGraphBot(graphBot, await _getExistingWorkspaces(), logger)
 	}
 	finally {
 		--specReloadEntryCount
@@ -405,31 +339,29 @@ async function _onBranchSpecReloaded(graphBot: GraphBot, logger: ContextualLogge
 
 async function init(logger: ContextualLogger) {
 
+	let p4 = PerforceContext.getServerContext(logger)
+
 	let lookupStream = async function(rootPath: string): Promise<string> {
 
-		const match = rootPath.match(/(\/\/.*?\/.*?)(\/|$)/)
-		if (match) {
-			const stream = match[1]
-
-			while (true) {
-				try {
-					const streams = await robo.p4.streams();
-					if (streams.has(stream)) {
-						break
+		while (true) {
+			try {
+				const stream = await p4.getStreamName(rootPath);
+				if (typeof stream === 'string') {
+					if (await p4.stream(stream)) {
+						return stream
 					}
 				}
-				catch (err) {
+				else {
+					logger.warn(stream.message)
+					return ""
 				}
-
-				const timeout = 5.0;
-				logger.info(`Will check for ${stream} again in ${timeout} sec...`);
-				await _setTimeout(timeout*1000);
 			}
-			return stream
-		}
-		else {
-			logger.warn(`Unable to determine stream from root path '${rootPath}'`)
-			return ""
+			catch (err) {
+			}
+
+			const timeout = 5.0;
+			logger.info(`Will look up stream from ${rootPath} again in ${timeout} sec...`);
+			await _setTimeout(timeout*1000);
 		}
 	}
 
@@ -442,25 +374,31 @@ async function init(logger: ContextualLogger) {
 		}
 
 		// Ensure we have a workspace for branch specs
-		const workspace: Object[] = await robo.p4.find_workspace_by_name(args.branchSpecsWorkspace)
+		const workspace: Object[] = await p4.find_workspace_by_name(args.branchSpecsWorkspace)
 		if (workspace.length === 0) {
 			logger.info(`Cannot find workspace ${args.branchSpecsWorkspace}, creating a new one.`)
 
 			if ((await lookupStream(args.branchSpecsRootPath)).length > 0) {
-				await robo.p4.newBranchSpecWorkspace(autoUpdaterConfig.workspace, args.branchSpecsRootPath)
+				await p4.newBranchSpecWorkspace(autoUpdaterConfig.workspace, args.branchSpecsRootPath)
 			}
 		}
 
 		// make sure we've got the latest branch specs
 		logger.info('Syncing latest branch specs')
-		await AutoBranchUpdater.init({p4: robo.p4}, autoUpdaterConfig, logger)
+		await AutoBranchUpdater.init(p4, autoUpdaterConfig, robo.roboMergeLogger)
 
 	} else {
 		logger.warn('Auto brancher updater not configured!')
 	}
 
+	if (args.gateUpdateWorkspacePrefix && args.gateUpdatesDirectory) {
+		Gate.init(args.gateUpdateWorkspacePrefix, args.gateUpdatesDirectory, logger)
+	} else {
+		logger.warn('Gate Update Workspace Prefix or Directory not specified. Gate updating via webpage may not work correctly.')
+	}
+
 	if (args.persistenceBackupFrequency > 0 && !args.previewOnly) {
-		const workspace: Object[] = await robo.p4.find_workspace_by_name(args.persistenceBackupWorkspace)
+		const workspace: Object[] = await p4.find_workspace_by_name(args.persistenceBackupWorkspace)
 		if (workspace.length === 0) {
 			logger.info(`Cannot find workspace ${args.persistenceBackupWorkspace}, creating a new one.`)
 
@@ -475,7 +413,7 @@ async function init(logger: ContextualLogger) {
 					AltRoots: roots,
 					Stream: stream
 				}		
-				await robo.p4.newWorkspace(args.persistenceBackupWorkspace, params)
+				await p4.newWorkspace(args.persistenceBackupWorkspace, params)
 			}
 		}
 	} else {
@@ -483,10 +421,7 @@ async function init(logger: ContextualLogger) {
 	}
 
 	_initMailer(logger)
-	_initGraphBots(await robo.p4.streams(), logger)
-	if (!DEBUG_SKIP_BRANCH_SETUP) {
-		await _initBranchWorkspacesForAllBots(logger)
-	}
+	await _initGraphBots(logger)
 
 	const graph = new Graph
 	robo.graph = new GraphAPI(graph)
@@ -502,7 +437,7 @@ function startBots(logger: ContextualLogger) {
 	logger.info("Starting branch bots...");
 	for (let graphBot of robo.graphBots.values()) {
 		if (AutoBranchUpdater.config) {
-			graphBot.autoUpdater = new AutoBranchUpdater(graphBot, logger)
+			graphBot.autoUpdater = new AutoBranchUpdater(graphBot, logger, args.previewOnly)
 		}
 		graphBot.runbots()
 	}
@@ -617,10 +552,10 @@ function shutdown(exitCode: number, logger: ContextualLogger) {
 process.once('SIGINT', () => { roboStartupLogger.error("Caught SIGINT"); shutdown(2, roboStartupLogger); });
 process.once('SIGTERM', () => { roboStartupLogger.error("Caught SIGTERM"); shutdown(0, roboStartupLogger); });
 
-function _initGraphBots(allStreamSpecs: StreamSpecs, logger: ContextualLogger) {
+async function _initGraphBots(logger: ContextualLogger) {
 	for (const botname of args.botname)	{
 		logger.info(`Initializing bot ${botname}`)
-		const graphBot = new GraphBot(botname, robo.mailer, args.externalUrl, allStreamSpecs)
+		const graphBot = await GraphBot.CreateAsync(botname, robo.mailer, args.externalUrl)
 		robo.graphBots.set(graphBot.branchGraph.botname, graphBot)
 
 		graphBot.reloadAsyncListeners.add(_onBranchSpecReloaded)
@@ -630,7 +565,7 @@ function _initGraphBots(allStreamSpecs: StreamSpecs, logger: ContextualLogger) {
 async function main(logger: ContextualLogger) {
 	while (true) {
 		try {
-			await initializePerforce(logger);
+			await initializePerforce(logger, vault, args.devMode);
 			break;
 		}
 		catch (err) {
@@ -641,8 +576,6 @@ async function main(logger: ContextualLogger) {
 			await _setTimeout(timeout*1000);
 		}
 	}
-	// log the user name
-	logger.info(`P4 appears to be configured. User=${getPerforceUsername()}`);
 
 	setGlobalAnalytics(new Analytics(args.hostInfo!))
 	robo = new RoboMerge;

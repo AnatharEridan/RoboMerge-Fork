@@ -13,17 +13,16 @@
     "test": "node dist/robo/unit-tests.js"
   },
   "dependencies": {
-    "@hpcc-js/graph": "^2.27.0",
-    "@hpcc-js/wasm": "^0.3.14",
     "@sentry/node": "^5.7.1",
     "@types/ldapjs": "^1.0.3",
     "@types/marked": "^4.0.2",
     "@types/mustache": "^0.8.32",
-    "@types/node": "^12.12.24",
+    "@types/node": "^22.9.0",
     "@types/nodemailer": "^4.3.4",
     "@types/sanitize-html": "^1.20.2",
     "@types/semver": "^6.0.2",
     "@types/swagger-ui-dist": "^3.0.3",
+    "@viz-js/viz": "^3.11.0",
     "colors": "^1.4.0",
     "jsonlint": "^1.6.3",
     "ldapauth-fork": "^4.0.2",
@@ -42,5 +41,6 @@
   "devDependencies": {
     "@types/intl": "^1.2.0",
     "@types/swagger-ui-express": "^3.0.1"
-  }
+  },
+  "packageManager": "pnpm@9.14.2+sha512.6e2baf77d06b9362294152c851c4f278ede37ab1eba3a55fda317a4a17b209f4dbb973fb250a77abc463a341fcb1f17f17cfa24091c4eb319cda0d9b84278387"
 }

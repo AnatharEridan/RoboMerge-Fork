@@ -21,6 +21,14 @@ export class Status {
 		}
 	}
 
+	addWarning(warning: string) {
+		this.validationWarnings.push(warning)
+	}
+
+	getWarnings() {
+		return this.validationWarnings
+	}
+
 	reportBotState(botName: string, state: GraphBotState) {
 		this.botStates.push([botName, state])
 	}
@@ -125,6 +133,7 @@ export class Status {
 
 	private allBranches: BranchStatus[] = []
 	private botStates: [string, GraphBotState][] = []
+	private validationWarnings: string[] = []
 }
 
 export function preprocess(data: UserStatusData) {
@@ -150,9 +159,5 @@ export function preprocess(data: UserStatusData) {
 				node.retry_cl = node.lastBlockage
 			}
 		}
-
-
-		// look for unblocked edges with a current conflict
-		// conflicts.find(c => c.cl === edge.last_cl)
 	}
 }

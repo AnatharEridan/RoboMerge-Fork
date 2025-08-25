@@ -1,30 +1,6 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 "use strict"
 
-function promptFor(map) {
-	var result = {};
-	var success = true;
-	$.each(Object.keys(map), function(_, key) {
-		if (success) {
-			var p = map[key];
-			var dflt = "";
-			if (typeof(p) === "object") {
-				dflt = p.default || "";
-				p = p.prompt || key;
-			}
-
-			var data = prompt(p, dflt);
-			if (data === null) {
-				success = false;
-			}
-			else {
-				result[key] = data;
-			}
-		}
-	});
-	return success ? result : null;
-}
-
 class BotPips {
 	constructor() {
 		this.blocked = 0;
@@ -121,7 +97,7 @@ function renderBranchList(data) {
 		let graphObj = branchGraphs.get(botName);
 		const branchSpecCl = botState.lastBranchspecCl;
 		if (!graphObj || graphObj.cl !== branchSpecCl) {
-			graphObj = {elem: showFlowGraph(branches, {singleBotName: botName, aliases: botState.aliases}), cl: branchSpecCl};
+			graphObj = {elem: showFlowGraph(branches, {singleBotName: botName, aliases: botState.aliases}, true), cl: branchSpecCl};
 			branchGraphs.set(botName, graphObj);
 		}
 	

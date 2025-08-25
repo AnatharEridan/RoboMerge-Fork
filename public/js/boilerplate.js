@@ -47,6 +47,30 @@ function createErrorMessage(xhr, error) {
 		return `HTTP ${xhr.status}: ${error}`;
 }
 
+function promptFor(map) {
+	var result = {};
+	var success = true;
+	$.each(Object.keys(map), function(_, key) {
+		if (success) {
+			var p = map[key];
+			var dflt = "";
+			if (typeof(p) === "object") {
+				dflt = p.default || "";
+				p = p.prompt || key;
+			}
+
+			var data = prompt(p, dflt);
+			if (data === null) {
+				success = false;
+			}
+			else {
+				result[key] = data;
+			}
+		}
+	});
+	return success ? result : null;
+}
+
 // Add way to prompt the user on leave/reload before the perform an action
 function addOnBeforeUnload(message) {
 	$( window ).on("beforeunload", function() {
@@ -57,17 +81,27 @@ function removeOnBeforeUnload() {
 	$( window ).off("beforeunload")
 }
 
-function makeClLink(cl, alias) {
+function makeClLink(cl, swarmURL, alias) {
 	if (typeof(cl) !== "number") {
 		return `<span style="font-weight:bolder">${cl}</span>`
 	}
-	return `<a href="https://p4-swarm.companyname.net/changes/${cl}" target="_blank">${alias ? alias : cl}</a>`
+	if (swarmURL) {
+		return `<a href="${swarmURL}/changes/${cl}" target="_blank">${alias || cl}</a>`
+	}
+	else {
+		return `${alias || cl}`
+	}
 }
 
-function makeSwarmFileLink(depotPath, alias) {
-	return `<a href="https://p4-swarm.companyname.net/files/${
-		encodeURI(depotPath.endsWith('/') ? depotPath.slice(2, -1) : depotPath.slice(2)) // Remove '//' (and any trailing slash) to ensure the URL is valid
-	}#commits" target="_blank">${alias ? alias : depotPath}</a>`
+function makeSwarmFileLink(depotPath, swarmURL, alias) {
+	if (swarmURL) {
+		return `<a href="${swarmURL}/files/${
+			encodeURI(depotPath.endsWith('/') ? depotPath.slice(2, -1) : depotPath.slice(2)) // Remove '//' (and any trailing slash) to ensure the URL is valid
+		}#commits" target="_blank">${alias ? alias : depotPath}</a>`
+	}
+	else {
+		return `${alias ? alias : depotPath}`
+	}
 }
 
 function debug(message) {
@@ -298,9 +332,17 @@ function handleUserPermissions(user) {
 		}
 	}
 
-	// Fulltime employees should see the log buttons.
+	// Everyone sees when logged in
+	$('#p4AllBotsButton').show();
+	$('#trackChangeButton').show();
+
+
+	// Fulltime employees should see a wider set of buttons.
 	if (isFTE) {
-		$('#fteButtons').show();
+		$('#logButton').show();
+		$('#lastCrashButton').show();
+		$('#p4TasksButton').show();
+		$('#branchesButton').show();
 	}
 }
 
@@ -451,39 +493,43 @@ function generateRobomergeHeader(createSignedInUserDiv = true) {
 function generateRobomergeFooter() {
 	let fixedFooterContents = $('<div class="button-bar">')
 
-	let fteButtonDiv = $('<div id="fteButtons">')
-	fteButtonDiv.hide()
-	fixedFooterContents.append(fteButtonDiv)
+	let buttonDiv = $('<div id="buttons">')
+	fixedFooterContents.append(buttonDiv)
 
 	let logButton = $('<button id="logButton">')
 	logButton.addClass("btn btn-sm btn-outline-dark")
 	logButton.click(function() { window.open('/api/logs', '_blank') })
 	logButton.text("Logs")
-	fteButtonDiv.append(logButton)
+	logButton.hide()
+	buttonDiv.append(logButton)
 
 	let lastCrashButton = $('<button id="lastCrashButton">')
 	lastCrashButton.addClass("btn btn-sm btn-outline-dark")
 	lastCrashButton.click(function() { window.open('/api/last_crash', '_blank') })
 	lastCrashButton.text("Last Crash")
-	fteButtonDiv.append(lastCrashButton)
+	lastCrashButton.hide()
+	buttonDiv.append(lastCrashButton)
 
 	let p4TasksButton = $('<button id="p4TasksButton">')
 	p4TasksButton.addClass("btn btn-sm btn-outline-dark")
 	p4TasksButton.click(function() { window.open('/api/p4tasks', '_blank') })
 	p4TasksButton.text("P4 Tasks")
-	fteButtonDiv.append(p4TasksButton)
-
-	let p4AllBotsButton = $('<button id="p4AllBotsButton">')
-	p4AllBotsButton.addClass("btn btn-sm btn-outline-dark")
-	p4AllBotsButton.click(function() { window.open('/allbots', '_blank') })
-	p4AllBotsButton.text("All bots graph")
-	fteButtonDiv.append(p4AllBotsButton)
+	p4TasksButton.hide()
+	buttonDiv.append(p4TasksButton)
 
 	let branchesButton = $('<button id="branchesButton">')
 	branchesButton.addClass("btn btn-sm btn-outline-dark")
 	branchesButton.click(function() { window.open('/api/branches', '_blank') })
 	branchesButton.text("Branch Data")
-	fteButtonDiv.append(branchesButton)
+	branchesButton.hide()
+	buttonDiv.append(branchesButton)
+
+	let p4AllBotsButton = $('<button id="p4AllBotsButton">')
+	p4AllBotsButton.addClass("btn btn-sm btn-outline-dark")
+	p4AllBotsButton.click(function() { window.open('/allbots', '_blank') })
+	p4AllBotsButton.text("All bots graph")
+	p4AllBotsButton.hide()
+	buttonDiv.append(p4AllBotsButton)
 
 	let trackChangeButton = $('<button id="trackChangeButton">')
 	trackChangeButton.addClass("btn btn-sm btn-outline-dark")
@@ -493,15 +539,22 @@ function generateRobomergeFooter() {
 		})
 		if (data) {
 			// Ensure they entered a CL
-			if (isNaN(parseInt(data.cl))) {
-				displayErrorMessage("Please provide a valid changelist number to track.")
-				return
+			if (!isNaN(parseInt(data.cl))) {
+				window.open(`/trackchange/${data.cl}`, '_blank') 
 			}
-			window.open(`/trackchange/${data.cl}`, '_blank') 
+			else {
+				const splitCL = data.cl.split(" ")
+				if (splitCL.length != 2 || isNaN(splitCL[1])) {
+					displayErrorMessage("Please provide a valid changelist number to track.")
+					return
+				}
+				window.open(`/trackchange/${splitCL[0]}/${splitCL[1]}`)
+			}
 		}
 	})
 	trackChangeButton.text("Track Change")
-	fteButtonDiv.append(trackChangeButton)
+	trackChangeButton.hide()
+	buttonDiv.append(trackChangeButton)
 
 	let currentlyRunningDiv = $('<div id="currentlyRunning">')
 	fixedFooterContents.append(currentlyRunningDiv)
@@ -859,7 +912,7 @@ function createNodeRow(nodeData, includeActions, includeCollapseControls=true) {
 
 	// Last Change Column 
 	if (window.showNodeLastChanges) {
-		columnArray.push(renderLastChangeCell_Common(nodeData.bot, nodeData.def.name, nodeData.last_cl, nodeAPIOp, operationArgs))
+		columnArray.push(renderLastChangeCell_Common(nodeData.bot, nodeData.def.name, nodeData.last_cl, nodeData.swarmURL, nodeAPIOp, operationArgs))
 	}
 	else {
 		columnArray.push($('<div>').addClass('lastchangecell'))
@@ -907,9 +960,9 @@ function createEdgeRow(nodeData, edgeData, includeActions) {
 	if (edgeData.num_changes_remaining > 1) {
 		catchupText = `pending: ${edgeData.num_changes_remaining}`
 	}
-	columnArray.push(renderLastChangeCell_Common(nodeData.bot, nodeData.def.name, edgeData.last_cl, edgeAPIOp,
-														operationArgs, catchupText, edgeData.display_name))
-	postRenderLastChangeCell_Edge(columnArray[columnArray.length - 1], edgeData)
+	columnArray.push(renderLastChangeCell_Common(nodeData.bot, nodeData.def.name, edgeData.last_cl, edgeData.swarmURL,
+													edgeAPIOp,operationArgs, catchupText, edgeData.display_name))
+	postRenderLastChangeCell_Edge(nodeData.bot, columnArray[columnArray.length - 1], edgeData, edgeAPIOp, operationArgs)
 
 	return columnArray
 }
@@ -972,7 +1025,12 @@ function renderNameCell_Common(data, botname) {
 			if (data.blockage.acknowledger) {
 				msg += `Acknowledged by ${data.blockage.acknowledger}, please contact for more information.<br />`;
 			} else {
-				msg += `Blocked but not acknowledged. Possible owner: ${data.blockage.owner}<br />`;
+				owner = data.blockage.owner
+				ownerMatch = owner?.match(/<!.*\|(.*)>/)
+				if (ownerMatch) {
+					owner = `@${ownerMatch[1]}`
+				}
+				msg += `Blocked but not acknowledged. Possible owner: ${owner}<br />`;
 			}
 		}
 
@@ -1027,13 +1085,17 @@ function createPauseDivs(data, conflict) {
 			data.blockage && data.blockage.change ? data.blockage.change :
 			'unknown'
 		
-		const info = conflict && conflict.kind ? `<span class="pause-div-label">Cause:</span> <strong>${conflict.kind.toLowerCase()}</strong>` :
+		let info = conflict && conflict.kind ? `<span class="pause-div-label">Cause:</span> <strong>${conflict.kind.toLowerCase()}</strong>` :
 			data.blockage ? `<span class="pause-div-label">Blocked.</span> Type: ${data.blockage.type}<br /> Message: ${data.blockage.message}` :
 			`No info can be provided. Please contact Robomerge help.`
 
+		if (conflict && conflict.slackLinks) {
+			info += `<br>${conflict.slackLinks.map(link => `<a href="${link}" target="_blank">Slack Thread</a>`).join("<br>")}`
+		}
+
 		divs.push($('<div class="info-block conflict">')
 			.append(
-				$('<p>').html('<h6>Blocked on change ' + makeClLink(changelist) + `</h6> ${info}`)
+				$('<p>').html('<h6>Blocked on change ' + makeClLink(changelist, data.swarmURL) + `</h6> ${info}`)
 			)
 		)
 	}
@@ -1212,9 +1274,9 @@ function renderStatusCell_Common(statusCell, data) {
 			let acknowledgedSince = new Date(data.blockage.acknowledgedAt);
 			let [ackDurationStr, ackDurationColor] = printDurationInfo("Acknowledged", Date.now() - acknowledgedSince.getTime())
 			$('<div class="blockage-details">')
-				.css('color', ackDurationColor)
-				.html(`${ackDurationStr} by <strong>${data.blockage.acknowledger}</strong>`)
-				.insertAfter(blockageinfoDiv)
+									.css('color', ackDurationColor)
+									.html(`${ackDurationStr} by <strong>${data.blockage.acknowledger}</strong>`)
+									.insertAfter(blockageinfoDiv)
 		}
 		// Determine who is responsible for resolving this.
 		else {
@@ -1415,7 +1477,8 @@ function renderActionsCell_Common(actionCell, data, operationFunction, operation
 			
 			// Can only create shelves for merge conflicts and commit failures
 			if (conflict.kind !== 'Merge conflict' &&
-				conflict.kind !== 'Commit failure') {
+				conflict.kind !== 'Commit failure' &&
+				conflict.kind !== 'Transfer error') {
 				shelfOption.addClass("disabled")
 				shelfOption.off('click')
 				// Bootstrap magic converts 'title' to 'data-original-title'
@@ -1588,11 +1651,9 @@ function renderActionsCell_Edge(actionCell, nodeData, edgeData, conflict=null) {
 		}
 	}
 
-	let tooManyFilesBlockage = conflict && conflict.kind === 'Too many files'
-
 	if (edgeData.is_blocked && edgeData.blockage && edgeData.blockage.targetBranchName) {
 		// Skip CL
-		const skipEnabled = tooManyFilesBlockage || !edgeData.disallowSkip
+		const skipEnabled = !edgeData.disallowSkip
 		
 		const skipChangelistText = `Skip Changelist ${edgeData.blockage.change}`
 		if (skipEnabled) {
@@ -1603,10 +1664,8 @@ function renderActionsCell_Edge(actionCell, nodeData, edgeData, conflict=null) {
 				edge: edgeData.blockage.targetBranchName
 			}) + location.hash
 
-			let tooltip = `Skip past the blockage caused by changelist ${edgeData.blockage.change}. `
-			tooltip += 
-				tooManyFilesBlockage ?  'Please ensure this large changelist has been integrated before skipping.' :
-				"This option should only be selected if the work does not need to be merged or you will merge this work youself."
+			const tooltip = `Skip past the blockage caused by changelist ${edgeData.blockage.change}. `
+				+ "This option should only be selected if the work does not need to be merged or you will merge this work youself."
 			const skipOption = createActionOption(skipChangelistText, function() {
 				window.location.href = skipRequest;
 			}, tooltip)
@@ -1639,10 +1698,10 @@ function renderActionsCell_Edge(actionCell, nodeData, edgeData, conflict=null) {
 }
 
 // Helper function to create last change cell
-function renderLastChangeCell_Common(botname, nodename, lastCl, operationFunction, operationArgs, catchupText=null, edgename=null) {
+function renderLastChangeCell_Common(botname, nodename, lastCl, swarmURL, operationFunction, operationArgs, catchupText=null, edgename=null) {
 	const lastChangeCell = $('<div>').addClass('lastchangecell')
 
-	const swarmLink = $(makeClLink(lastCl)).appendTo(lastChangeCell)
+	const swarmLink = $(makeClLink(lastCl, swarmURL)).appendTo(lastChangeCell)
 	if (catchupText) {
 		lastChangeCell.append($('<div>').addClass('catchup').text(catchupText))
 	}
@@ -1702,11 +1761,11 @@ function prettyDate(date) {
 	}
 }
 
-function postRenderLastChangeCell_Edge(lastChangeCell, edgeData) {
+function postRenderLastChangeCell_Edge(botname, lastChangeCell, edgeData, operationFunction, operationArgs) {
 	if (edgeData.lastGoodCL) {
-		let tooltip = 'CL approved by CIS'
+		let tooltip = edgeData.lastGoodCLJobLink ? 'CL approved by CIS' : 'Paused at CL'
 		if (edgeData.lastGoodCLDate) {
-			tooltip += ` on ${prettyDate(new Date(edgeData.lastGoodCLDate))}`
+			tooltip += ` submitted ${prettyDate(new Date(edgeData.lastGoodCLDate))}`
 		}
 		if (edgeData.headCL) {
 			tooltip += ` (head changelist ${edgeData.headCL})`
@@ -1714,6 +1773,37 @@ function postRenderLastChangeCell_Edge(lastChangeCell, edgeData) {
 		
 		let goodCL = edgeData.lastGoodCLJobLink ? $(`<a href="${edgeData.lastGoodCLJobLink}">`).prop('target', '_blank') : $('<div>');
 		goodCL.html('\u{2713} ' + edgeData.lastGoodCL).addClass('last-good-cl').prop('title', tooltip).appendTo(lastChangeCell)
+
+		if (!edgeData.lastGoodCLJobLink)
+		{
+			// On shift+click, we can set the CL instead
+			goodCL.click(function(evt) {
+				if (evt.shiftKey)
+				{
+					let data = promptFor({
+						cl: {prompt: 'Enter CL', default: edgeData.lastGoodCL},
+					})
+					if (data) {
+						data.reason = "manually set through Robomerge homepage"
+
+						operationFunction(...operationArgs, "/set_gate_cl?" + toQuery(data), function(success) {
+							if (success) {
+								updateBranchList(botname)
+								displaySuccessfulMessage(`Successfully set gate for ${edgeData.displayName} to changelist ${data.cl}`)
+							} else {
+								displayErrorMessage(`Error setting gate for ${edgeData.displayName} to changelist ${data.cl}, please check logs.`)
+							}
+						})
+						
+					}
+					if (evt.preventDefault) {
+						evt.preventDefault()
+					}
+					return false
+				}
+				return true
+			})
+		}
 	}
 }
 
@@ -1881,7 +1971,7 @@ if (!onLoginPage) {
 				$('.tags', $container).text(data.user.privileges && Array.isArray(data.user.privileges) ? ` (${data.user.privileges.join(', ')})` : '');
 
 				if (data.insufficientPrivelege) {
-					setErrorText('There are bots running but logged in user does not have admin access');
+					displayErrorMessage('There are bots running but logged in user does not have access to see any');
 				}
 
 			}

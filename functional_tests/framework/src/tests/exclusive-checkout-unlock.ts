@@ -26,7 +26,7 @@ export class ExclusiveCheckoutUnlock extends FunctionalTest {
 	}
 
 	run() {
-		// second user commits change in Release well first user has file in main checked out
+		// second user commits change in Release while first user has file in main checked out
 		return P4Util.editFileAndSubmit(this.releaseUser2Client, 'test.uasset', 'New content')
 	}
 
@@ -34,7 +34,6 @@ export class ExclusiveCheckoutUnlock extends FunctionalTest {
 		await this.ensureBlocked('Release', 'Main')
         await this.verifyAndPerformUnlock('Release', 'Main')
         await this.ensureNotBlocked('Release', 'Main')
-
 	}
 
 	getBranches() {

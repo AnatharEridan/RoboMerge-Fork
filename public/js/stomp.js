@@ -197,12 +197,12 @@ function transitionDisplayStompResults() {
 }
 
 // Create visualization of the changelist, with links to swarm, a display of the description and a list of relevant files to this request
-function visualizeChangelist(changelist, changelistData) {
+function visualizeChangelist(changelist, changelistData, swarmURL) {
     const changelistDiv = $(`<div id="${changelist}" class="stomp-visual">`)
     if (robomergeUser && changelistData.author.toLowerCase() === robomergeUser.userName.toLowerCase()) {
-        changelistDiv.append($('<h3>').html(`${makeClLink(changelist)} by <strong>you</strong>`))
+        changelistDiv.append($('<h3>').html(`${makeClLink(changelist, swarmURL)} by <strong>you</strong>`))
     } else {
-        changelistDiv.append($('<h3>').html(`${makeClLink(changelist)} by ${changelistData.author}`))
+        changelistDiv.append($('<h3>').html(`${makeClLink(changelist, swarmURL)} by ${changelistData.author}`))
     }
     changelistDiv.append($('<hr style="margin-top:0em; border-width: 2px;">'))
 
@@ -234,38 +234,33 @@ function visualizeChangelist(changelist, changelistData) {
 }
 
 function visualizeStompVerification(requestedBranchCl, stompJson) {
-    // Debug
-    const prettyJson = JSON.stringify(stompJson, null, 2)
-    console.log(`Stomp Verification Debug JSON:\n${prettyJson}`)
-    let linkToSwarm = makeClLink(requestedBranchCl, `CL ${requestedBranchCl}`)
-
     // For visualization, sort data by stomped revision
     // (JSON data is sorted by file)
     let clDict = {}
     let encounteredStompedRevisionsCalculationIssues = false
     for (const file of stompJson.files) {
-        const linkToSwarm = makeSwarmFileLink(file.targetFileName)
+        const swarmFileLink = makeSwarmFileLink(file.targetFileName, stompJson.swarmURL)
 
         // Process resolved files
         if (file.resolved) {
             // Add text files to the warning list
             if (file.filetype.startsWith('text')) {
                 $('#mixedMergeWarningList').append(
-                    $('<li>').html(linkToSwarm)
+                    $('<li>').html(swarmFileLink)
                 )
             }
         } 
         // Add unresolved text files to the error list
         else if (file.filetype.startsWith('text')) {
             $('#unresolvedTextFilesList').append(
-                $('<li>').html(linkToSwarm)
+                $('<li>').html(swarmFileLink)
             )
         }
 
         if (file.stompedRevisionsSkipped) {
             $('#stompedRevisionsSkippedDiv').removeClass('initiallyHidden')
             $('#stompedRevisionsSkippedList').append(
-                $('<li>').html(linkToSwarm)
+                $('<li>').html(swarmFileLink)
             )
             // If this file skipped stomped revisions, don't bother attempting to add to clDict
             continue
@@ -274,7 +269,7 @@ function visualizeStompVerification(requestedBranchCl, stompJson) {
         if (file.stompedRevisionsCalculationIssues) {
             encounteredStompedRevisionsCalculationIssues = true
             $('#stompedRevisionsIssuesList').append(
-                $('<li>').html(linkToSwarm)
+                $('<li>').html(swarmFileLink)
             )
             // If this file couldn't calculate stomped revisions, don't bother attempting to add to clDict
             continue
@@ -301,6 +296,8 @@ function visualizeStompVerification(requestedBranchCl, stompJson) {
             }
         }
     }
+
+    const linkToSwarm = makeClLink(requestedBranchCl, stompJson.swarmURL, `CL ${requestedBranchCl}`)
 
     if (encounteredStompedRevisionsCalculationIssues) {
         $('#stompedRevisionsIssuesDiv').removeClass('initiallyHidden')
@@ -331,7 +328,7 @@ function visualizeStompVerification(requestedBranchCl, stompJson) {
     // Now display each changelist
     const sortedKeys = Object.keys(clDict).sort()
     sortedKeys.forEach(function(key) {
-        $('#resultVisualization').append(visualizeChangelist(key, clDict[key]))
+        $('#resultVisualization').append(visualizeChangelist(key, clDict[key], stompJson.swarmURL))
     })
 }
 

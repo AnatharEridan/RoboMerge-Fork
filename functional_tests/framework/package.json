@@ -12,7 +12,7 @@
   "dependencies": {
     "@types/bent": "^7.0.2",
     "@types/mustache": "^0.8.32",
-    "@types/node": "^12.12.34",
+    "@types/node": "^22.9.0",
     "bent": "^7.1.2",
     "colors": "^1.4.0",
     "jsonlint": "^1.6.3",

@@ -5,17 +5,18 @@ import * as p4util from '../common/p4util';
 
 import { ContextualLogger } from "../common/logger";
 import { Recipients } from "../common/mailer";
-import { Change, coercePerforceWorkspace, ConflictedResolveNFile, EditChangeOpts, EXCLUSIVE_CHECKOUT_REGEX, getRootDirectoryForBranch, IntegrationSource, IntegrationTarget, isExecP4Error, OpenedFileRecord, PerforceContext } from "../common/perforce";
+import { Change, coercePerforceWorkspace, ConflictedResolveNFile, EdgeServer, EditChangeOpts, ExclusiveFileDetails, EXCLUSIVE_CHECKOUT_REGEX, getRootDirectoryForBranch, IntegrationSource, IntegrationTarget, isExecP4Error, PerforceContext } from "../common/perforce";
 import { VersionReader } from "../common/version";
 import { EdgeBotInterface, IPCControls, ReconsiderArgs } from "./bot-interfaces";
-import { AlreadyIntegrated, Branch, ChangeInfo, ConflictingFile, ExclusiveFile, Failure, MergeAction, PendingChange } from "./branch-interfaces";
-import { EdgeOptions } from "./branchdefs";
+import { AlreadyIntegrated, Branch, ChangeInfo, ConflictingFile, Failure, MergeAction, PendingChange } from "./branch-interfaces";
+import { EdgeOptions, IntegrationMethod } from "./branchdefs";
 import { PersistentConflict } from "./conflict-interfaces";
 import { BotEventTriggers } from "./events";
 import { Gate } from "./gate";
 import { NodeBot } from "./nodebot";
 import { isUserAKnownBot, postMessageToChannel } from "./notifications";
 import { PerforceStatefulBot } from "./perforce-stateful-bot";
+import { getExclusiveLockOpenedsToRun } from "./roboargs";
 import { Context } from "./settings";
 import { SlackMessageStyles } from "./slack";
 import { PauseState } from "./state-interfaces";
@@ -23,17 +24,13 @@ import { BlockagePauseInfo, BlockagePauseInfoMinimal, EdgeStatusFields } from ".
 import { getIntegrationOwner } from "./targets";
 
 const FAILED_CHANGELIST_PAUSE_TIMEOUT_SECONDS = 15 * 60
-const MAX_INTEGRATION_ERRORS_TO_ANALYZE = 5
-const DEPOT_FILE_REGEX = /^(.*[\\\/])(.*)/
 const JIRA_REGEX = /^\s*#jira\s+(.*)/i
-
-const MAX_CONFLICTS_TO_LIST = 5
 
 // type ResolveResultDetail = 'quick' | 'detailed'
 
 type EdgeIntegrationResult = 'ok' | 'shelved' | 'nothing to do' | 'skipped' | 'error'
 
-class EdgeIntegrationDetails {
+export class EdgeIntegrationDetails {
 	result: EdgeIntegrationResult
 	message = ''
 	cl = -1 // either submitted or shelved cl (may need Change in shelved case, let's see)
@@ -118,7 +115,7 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		this.graphBotName = sourceNode.graphBotName
 		this.edgeBotLogger = new ContextualLogger(this.fullNameForLogging)
 
-		this.p4 = new PerforceContext(this.edgeBotLogger)
+		this.p4 = PerforceContext.getServerContext(this.edgeBotLogger, sourceNode.branch.config.streamServer)
 		this.eventTriggers.onChangeParsed((info: ChangeInfo) => this.onGlobalChange(info))
 		this.gate = new Gate(
 			{ from: this.sourceBranch
@@ -173,6 +170,9 @@ class EdgeBotImpl extends PerforceStatefulBot {
 	get excludedAuthors() {
 		return this.options.excludeAuthors || []
 	}
+	get excludedDescriptions() {
+		return this.options.excludeDescriptions || []
+	}
 	protected get logger() {
 		return this.edgeBotLogger
 	}
@@ -195,6 +195,10 @@ class EdgeBotImpl extends PerforceStatefulBot {
 	async tick() {
 		// Update the Last Good Change from the gate file in Perforce
 		this.gate.tick()
+		if (this.sourceNode.previewMode) {
+		    return true
+		}
+		// Add any actions that should occur only if not in preview mode here
 		return true
 	}
 
@@ -240,20 +244,17 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		const results: ConflictingFile[] = []
 
 		for (const file of unresolved) {
-			const match = file.fromFile.match(DEPOT_FILE_REGEX)
-			if (match) {
-				if (file.resolveType.toLowerCase() === "branch") {
-					results.push({name: match[2], kind: "branch"})
-				}
-				else if (file.resolveType.toLowerCase() === "delete") {
-					results.push({name: match[2], kind: "delete"})
-				}
-				else if (file.resolveType.toLowerCase() === "content") {
-					results.push({name: match[2], kind: "merge"})
-				} else {
-					// We really shouldn't get this kind, but it's better to display unknown than skip displaying the file
-					results.push({name: match[2], kind: "unknown"})
-				}
+			if (file.resolveType.toLowerCase() === "branch") {
+				results.push({name: file.fromFile, kind: "branch"})
+			}
+			else if (file.resolveType.toLowerCase() === "delete") {
+				results.push({name: file.fromFile, kind: "delete"})
+			}
+			else if (file.resolveType.toLowerCase() === "content") {
+				results.push({name: file.fromFile, kind: "merge"})
+			} else {
+				// We really shouldn't get this kind, but it's better to display unknown than skip displaying the file
+				results.push({name: file.fromFile, kind: "unknown"})
 			}
 		}
 		return results
@@ -261,27 +262,21 @@ class EdgeBotImpl extends PerforceStatefulBot {
 
 	private async analyzeIntegrationError(errors: string[]) {
 		
-		const openedRequests: [RegExpMatchArray, Promise<OpenedFileRecord[]>, Promise<OpenedFileRecord[]>][] = []
+		let results: ExclusiveFileDetails[] = []
+		let paths = []
 		for (const err of errors) {
 			const match = err.match(EXCLUSIVE_CHECKOUT_REGEX)
 			if (match) {
-				openedRequests.push([match, this.p4.opened(null, match[1] + match[2], true), this.p4.opened(null, match[1] + match[2])])
+				if (paths.length < getExclusiveLockOpenedsToRun()) {
+					paths.push({depotPath: match[1] + match[2], name: match[2]})
+				} else {
+					results.push({depotPath: match[1] + match[2], name: match[2], user: "", client: ""})
+				}
 			}
 		}
 
-		const results: ExclusiveFile[] = []
-		for (const [match, exclusiveReq, addReq] of openedRequests) {
-			const recs = await exclusiveReq
-			if (recs.length > 0) {
-				// should only be one, since we're looking for exclusive check-out errors
-				results.push({depotPath: match[1] + match[2], name: match[2], user: recs[0].user, client: recs[0].client})
-			} else {
-				const recs = await addReq
-				if (recs.length > 0) {
-					// should only be one, since we're looking for exclusive check-out errors
-					results.push({depotPath: match[1] + match[2], name: match[2], user: recs[0].user, client: recs[0].client})
-				}
-			}
+		if (paths.length > 0) {
+			results = [...(await this.p4.getOpenedDetails(paths)),...results]
 		}
 
 		return results
@@ -294,13 +289,14 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		if (pending.change.userRequest) {
 			const owner = getIntegrationOwner(pending) || pending.change.author
 			const shelfMsg = `${owner}, please merge this change by hand.\nMore info at ${this.sourceNode.getBotUrl()}\n\n` + failure.description
-			await this.shelveChangelist(pending, false, shelfMsg)
+			pending.change.additionalDescriptionText = `#ROBOMERGE-CONFLICT from-shelf\n`
+			await this.shelveChangelist(pending, {reason: shelfMsg})
 			this.edgeBotLogger.info(`${logMessage}. Shelved CL ${pending.newCl} for ${owner} to resolve manually (from reconsider).`)
 			return
 		}
 
 		this.edgeBotLogger.info(`${logMessage}. Reverting ${pending.newCl}.`)
-		await this.revertAndDelete(coercePerforceWorkspace(this.targetBranch.workspace)!.name, pending.newCl)
+		await this.p4.revertAndDelete(coercePerforceWorkspace(pending.change.targetWorkspace)!.name, pending.newCl)
 
 		let pauseDurationSeconds = FAILED_CHANGELIST_PAUSE_TIMEOUT_SECONDS
 		// if we have a target, make sure pause duration is at least 2x duration of failed integration
@@ -316,7 +312,7 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		this.block(this.createEdgeBlockageInfo(failure, pending), pauseDurationSeconds)
 	}
 
-	performMerge(info: ChangeInfo, target: MergeAction, convertIntegratesToEdits: boolean, additionalDescription: string): Promise<EdgeIntegrationDetails> {
+	performMerge(info: ChangeInfo, target: MergeAction, additionalDescription: string): Promise<EdgeIntegrationDetails> {
 		// make sure we come back in here afterwords
 		this._log_action(`Merging CL ${info.cl} via ${this.fullName} (${target.mergeMode})`)
 
@@ -354,10 +350,16 @@ class EdgeBotImpl extends PerforceStatefulBot {
 			if (overriddenOwner.startsWith('@')) {
 				overriddenOwner = `@ ${overriddenOwner.substring(1)}`
 			}
+			else if (overriddenOwner.startsWith('<')) {
+				const subteamMatch = overriddenOwner.match(/<!subteam\^\w+\|([^>]+)>/)
+				if (subteamMatch) {
+					overriddenOwner = `@ ${subteamMatch[1]}`
+				}
+			}
 			description += `#ROBOMERGE-OWNER: ${overriddenOwner}\n`
 		}
 
-		// keep track of author in a tag in case transfering onwership of the changelist fails
+		// keep track of author in a tag in case transfering ownership of the changelist fails
 		const authorTag = info.authorTag || info.author
 		if (authorTag !== 'robomerge') {
 			description += `#ROBOMERGE-AUTHOR: ${authorTag}\n`
@@ -367,12 +369,14 @@ class EdgeBotImpl extends PerforceStatefulBot {
 			description += '#robomerge #ignore\n'
 		}
 
-		if (info.overriddenCommand) {
-			// probably no need to remove #s, but feels safer
-			description += `#ROBOMERGE-COMMAND: ${info.overriddenCommand.replace(/#/g, '_')}\n`
-		}
-		if (info.macros.length > 0) {
-			description += `#ROBOMERGE-COMMAND: ${info.macros.join(', ')}\n`	
+		if (!this.incognitoMode) {
+			if (info.overriddenCommand) {
+				// probably no need to remove #s, but feels safer
+				description += `#ROBOMERGE-COMMAND: ${info.overriddenCommand.replace(/#/g, '_')}\n`
+			}
+			if (info.macros.length > 0) {
+				description += `#ROBOMERGE-COMMAND: ${info.macros.join(', ')}\n`	
+			}
 		}
 		let source = info.source
 		if (this.incognitoMode) {
@@ -432,15 +436,15 @@ class EdgeBotImpl extends PerforceStatefulBot {
 			}
 		}
 
-		if (convertIntegratesToEdits) {
-			// just for visibility - not used by RoboMerge
-			description += '#ROBOMERGE-EDIGRATE\n'
-		}
-
 		target.description = description + additionalDescription
 
-		// do the integration
-		return this.integrate(info, target)
+		if (target.branch.config.streamServer != this.sourceBranch.config.streamServer) {
+			return this.transfer(info, target)
+		}
+		else {
+			// do the integration
+			return this.integrate(info, target)
+		}
 	}
 
 	public resetIntegrationTimestamp() {
@@ -456,6 +460,86 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		this.sourceNode.queueEdgeUnblock(this.targetBranch.upperName)
 	}
 
+	public async getWorkspace(edgeServer?: EdgeServer, p4? : PerforceContext) {
+
+		p4 = p4 || this.p4
+		const edgeServerAddress: string | undefined = edgeServer && edgeServer.address
+
+		// name the workspace
+		let workspaceName = this.options.workspaceNameOverride || ['ROBOMERGE', this.targetBranch.parent.botname, this.targetBranch.name].join('_');
+		if (!this.options.workspaceNameOverride) {
+			let fromName = `_FROM_${(this.targetBranch.parent == this.sourceBranch.parent ? '' : this.sourceBranch.parent.botname)}_${this.sourceBranch.name}`
+			if (this.incognitoMode) {
+				const hashCode = (s: string) => s.split('').reduce((a,b)=>{a=((a<<5)-a)+b.charCodeAt(0);return a&a},0)
+				workspaceName += '_' + hashCode(fromName)
+			}
+			else {
+				workspaceName += fromName
+			}
+		}
+		const p4username = p4.username
+		if (p4username !== 'robomerge') {
+			workspaceName = [p4username!.toUpperCase(), process.platform.toUpperCase(), workspaceName].join('_')
+		}
+		workspaceName = workspaceName.replace(/[\/\.-\s]/g, "_").replace(/_+/g,"_");
+		if (edgeServer) {
+			workspaceName += '_' + edgeServer.id.toUpperCase()
+		}
+
+		// ensure root directory exists (we set the root diretory to be the cwd)
+		const path = getRootDirectoryForBranch(workspaceName);
+		if (!fs.existsSync(path)) {
+			this.logger.info(`Making directory ${path}`);
+			fs.mkdirSync(path);
+		}
+
+		// do we already have a workspace?
+		const existingWorkspaceInfo = await p4.find_workspace_by_name(workspaceName, {edgeServerAddress, includeUnloaded: true})
+		if (existingWorkspaceInfo.length > 0) {
+			if (existingWorkspaceInfo[0].IsUnloaded) {
+				await p4.reloadWorkspace(workspaceName, edgeServerAddress)
+			}
+			await p4util.cleanWorkspace(this.logger, p4, this.graphBotName, {name: workspaceName, directory: path}, this.targetBranch.rootPath, edgeServerAddress)
+		}
+		else {
+			const params: any = {};
+			if (this.targetBranch.stream) {
+				params['Stream'] = this.targetBranch.stream;
+			}
+			else {
+				params['View'] = [
+					`${this.targetBranch.rootPath} //${workspaceName}/...`
+				];
+			}
+
+			await p4.newGraphBotWorkspace(workspaceName, params, edgeServer);
+
+			// if we're on linux, remove the directory whenever we create the workspace for the first time
+			if (process.platform === "linux") {
+				const dir = '/src/' + workspaceName;
+				this.logger.info(`Cleaning ${dir}...`);
+
+				// delete the directory contents (but not the directory)
+				require('child_process').execSync(`rm -rf ${dir}/*`);
+			}
+			else {
+				await p4.clean(workspaceName, edgeServer?.address);
+			}
+		}
+		
+		return workspaceName
+	}
+
+	private async SkipIntegration(pending: PendingChange, edgeServerAddress: string|undefined, msg: string) {
+		const event: AlreadyIntegrated = {change: pending.change, action: pending.action}
+		this.sourceNode.onAlreadyIntegrated(event)
+
+		// integration not necessary
+		this.edgeBotLogger.info(msg)
+		await this.p4.deleteCl(pending.change.targetWorkspace, pending.newCl, edgeServerAddress)
+		return new EdgeIntegrationDetails('nothing to do', msg)		
+	}
+
 	private async integrate(info: ChangeInfo, target: MergeAction) : Promise<EdgeIntegrationDetails> {
 		const to_integrate = info.cl
 		this._log_action(`Integrating CL ${to_integrate} to ${this.targetBranch.name}`)
@@ -463,45 +547,12 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		// if required, add author review here so they're not in target.description, which is used for shelf description in case of conflict
 		const desc = target.description! // target.description always ends in newline
 
-		info.targetWorkspaceOverride = coercePerforceWorkspace(this.targetBranch.workspace)!.name
-		const edgeServer = info.edgeServerToHostShelf
-		if (edgeServer) {
+		info.targetWorkspace = await this.getWorkspace(info.edgeServerToHostShelf)
 
-			info.targetWorkspaceOverride += '_' + edgeServer.id.toUpperCase()
-
-			// make sure target workspace/directory exists (always reset for now)
-
-			// ensure local directory exists (_initWorkspacesForGraphBot)
-			const path = getRootDirectoryForBranch(info.targetWorkspaceOverride);
-			if (!fs.existsSync(path)) {
-				this.edgeBotLogger.info(`Making directory ${path}`);
-				fs.mkdirSync(path);
-			}
-
-			// do we already have a workspace? (_initBranchWorkspacesForAllBots, _getExistingWorkspaces)
-			const existingWorkspaceInfos = await this.p4.find_workspaces(undefined, {edgeServerAddress: edgeServer.address, includeUnloaded: true})
-			const existingWorkspaceIndex = existingWorkspaceInfos.findIndex((ws) => ws.client == info.targetWorkspaceOverride)
-			if (existingWorkspaceIndex >= 0) {
-				if (existingWorkspaceInfos[existingWorkspaceIndex].IsUnloaded) {
-					await this.p4.reloadWorkspace(info.targetWorkspaceOverride, edgeServer.address)
-				}
-				await p4util.cleanWorkspaces(this.p4, [[info.targetWorkspaceOverride, target.branch.rootPath]], edgeServer.address)
-			}
-			else {
-				// create one 
-				if (!target.branch.stream) {
-					throw new Error('only stream workspaces supported on edge servers')
-				}
-				await this.p4.newGraphBotWorkspace(info.targetWorkspaceOverride, {Stream: target.branch.stream}, edgeServer)
-
-				// _initWorkspacesForGraphBot does clean-up stuff here, but I don't think it's necessary
-			}
-		}
-
-		const edgeServerAddress: string | undefined = edgeServer && edgeServer.address
+		const edgeServerAddress = info.edgeServerToHostShelf && info.edgeServerToHostShelf.address
 
 		// create a new CL
-		const changenum = await this.p4.new_cl(info.targetWorkspaceOverride, desc, undefined, edgeServerAddress)
+		const changenum = await this.p4.new_cl(info.targetWorkspace, desc, undefined, edgeServerAddress)
 
 		// try to integrate
 		const branchSpecToTarget = this.sourceBranch.branchspec.get(this.targetBranch.upperName)
@@ -526,8 +577,8 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		    || (!info.userRequest && !info.forceCreateAShelf && !target.flags.has('manual'))
 
 		this.currentIntegrationStartTimestamp = Date.now()
-		await this.p4.sync(info.targetWorkspaceOverride, this.targetBranch.rootPath + '#0', {edgeServerAddress})
-		const [mode, results] = await this.p4.integrate(info.targetWorkspaceOverride, source, changenum, integTarget, {edgeServerAddress, virtual: doVirtualMerge})
+		await this.p4.sync(info.targetWorkspace, this.targetBranch.rootPath + '#0', {edgeServerAddress})
+		const [mode, results] = await this.p4.integrate(info.targetWorkspace, source, changenum, integTarget, {edgeServerAddress, virtual: doVirtualMerge})
 
 		const pending: PendingChange = {change: info, action: target, newCl: changenum}
 
@@ -539,14 +590,11 @@ class EdgeBotImpl extends PerforceStatefulBot {
 
 			case 'already_integrated':
 			case 'no_files': {
-				const msg = `Change ${to_integrate} was not necessary in ${this.targetBranch.name}`
-				const event: AlreadyIntegrated = {change: info, action: target}
-				this.sourceNode.onAlreadyIntegrated(event)
-
-				// integration not necessary
-				this.edgeBotLogger.info(msg)
-				await this.p4.deleteCl(info.targetWorkspaceOverride, changenum, edgeServerAddress)
-				return new EdgeIntegrationDetails('nothing to do', msg)
+				return await this.SkipIntegration(
+					pending,
+					edgeServerAddress,
+					`Change ${to_integrate} was not necessary in ${this.targetBranch.name}`
+				)
 			}
 		}
 
@@ -558,12 +606,8 @@ class EdgeBotImpl extends PerforceStatefulBot {
 
 		if (exclusiveFiles.length > 0) {
 			// will need to store the exclusive file if we want to @ people in Slack
-			const exclCheckoutMessages = exclusiveFiles.map(exc => `${exc.depotPath} checked out by ${exc.user}`)
-			if (errors.length > MAX_INTEGRATION_ERRORS_TO_ANALYZE) {
-				exclCheckoutMessages.push(`... and ${errors.length - MAX_INTEGRATION_ERRORS_TO_ANALYZE} more`)
-			}
 			const exclusiveLockUsers = Array.from(new Set(exclusiveFiles.map(exc => `${exc.user.toLowerCase()}`))).map(user => ({user, userEmail: this.p4.getEmail(user)}))
-			failure = { kind: 'Exclusive check-out', description, summary: exclCheckoutMessages.join('\n'), additionalInfo: {exclusiveLockUsers,exclusiveFiles} }
+			failure = { kind: 'Exclusive check-out', description, additionalInfo: {exclusiveLockUsers,exclusiveFiles} }
 		}
 		else {
 			failure  = { kind: 'Integration error', description }
@@ -571,7 +615,7 @@ class EdgeBotImpl extends PerforceStatefulBot {
 
 		// Revert attempt
 		if (pending.newCl > 0) {
-			await this.revertAndDelete(info.targetWorkspaceOverride, pending.newCl, edgeServerAddress)
+			await this.p4.revertAndDelete(info.targetWorkspace, pending.newCl, edgeServerAddress)
 			pending.newCl = -1
 		}
 		
@@ -585,22 +629,101 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		if (await this.sourceNode.handleMergeFailure(failure, pending)) {
 			this.gate.onBlockage()
 		}
-		return new EdgeIntegrationDetails('error', errors.join('\n'))
+		return new EdgeIntegrationDetails('error', description)
 	}
 
-	private async revertAndDelete(roboWorkspace: string, cl: number, edgeServerAddress?: string) {
-		this._log_action(`Reverting CL ${cl}`);
-		await this.p4.revert(roboWorkspace, cl, [], edgeServerAddress);
+	private async transfer(info: ChangeInfo, target: MergeAction) : Promise<EdgeIntegrationDetails> {
+		const to_integrate = info.cl
+		this._log_action(`Integrating CL ${to_integrate} to ${this.targetBranch.name}`)
 
-		this._log_action(`Deleting CL ${cl}`);
-		await this.p4.deleteCl(roboWorkspace, cl, edgeServerAddress);
+		// if required, add author review here so they're not in target.description, which is used for shelf description in case of conflict
+		const desc = target.description! // target.description always ends in newline
+
+		const targetServerP4 = PerforceContext.getServerContext(this.logger, target.branch.config.streamServer)
+		info.targetWorkspace = await this.getWorkspace(undefined, targetServerP4)
+
+		// create a new CL
+		const changenum = await targetServerP4.new_cl(info.targetWorkspace, desc)
+
+		// try to integrate
+		const branchSpecToTarget = this.sourceBranch.branchspec.get(this.targetBranch.upperName)
+		const source : IntegrationSource = {
+			branchspec: branchSpecToTarget,
+			changelist: to_integrate,
+			depot: this.sourceBranch.depot,
+			path_from: this.sourceBranch.rootPath,
+			stream: this.sourceBranch.stream
+		}
+		const integTarget : IntegrationTarget = {
+			depot: this.targetBranch.depot,
+			path_to: this.targetBranch.rootPath,
+			stream: this.targetBranch.stream
+		}
+
+		this.currentIntegrationStartTimestamp = Date.now()
+		await targetServerP4.sync(info.targetWorkspace, this.targetBranch.rootPath + '#0')
+		const failures = await this.p4.transfer(targetServerP4, info.targetWorkspace, source, changenum, integTarget, info.forceCreateAShelf)
+
+		const pending: PendingChange = {change: info, action: target, newCl: changenum}
+
+		let description = failures.join('\n')
+		let failure: Failure | null = null
+
+		if (info.forceCreateAShelf) {
+			// the user requested manual merge
+			await this.shelveChangelist(pending, {targetServerP4})
+
+			if (!pending.change.sendNoShelfNotification) {
+				await this.sourceNode.notifyShelfRequester(pending)
+			}
+			
+			return new EdgeIntegrationDetails('shelved', pending.newCl)			
+		}
+		else if (failures.length == 0) {
+			// no failures, try to submit
+			const result = await this.submitChangelist(pending, 0, targetServerP4)
+			if (result.result !== 'error') {
+				return result
+			}
+
+			let details: string | undefined
+			const match = result.message.match(/.*STDERR:([^]*)STDOUT:/)
+			if (match)
+			{
+				details = match[1].trim()
+			}
+
+			failure = { kind: 'Commit failure', description: result.message, details }
+			description = `${failure.kind}: ${failure.description}`
+		}
+		else {
+			failure  = { kind: 'Transfer error', description }
+		}
+
+		// Revert attempt
+		if (pending.newCl > 0) {
+			await targetServerP4.revertAndDelete(info.targetWorkspace, pending.newCl)
+			pending.newCl = -1
+	}
+
+		if (!pending.change.userRequest) {
+			// Pause Edge
+			const pauseInfo = this.createEdgeBlockageInfo(failure, pending)
+			this.block(pauseInfo, FAILED_CHANGELIST_PAUSE_TIMEOUT_SECONDS)
+		}
+
+		// Send to source node to facilitate notification handling
+		if (await this.sourceNode.handleMergeFailure(failure, pending)) {
+			this.gate.onBlockage()
+		}
+		return new EdgeIntegrationDetails('error', description)
 	}
 
 	async revertPendingCLWithShelf(client: string, change: number, userContext: string) {
 		this._log_action(` ${userContext} - Deleting shelf from and reverting ${change}`)
 		try {
 			this.edgeBotLogger.info(await this.p4.delete_shelved(client, change))
-			await this.revertAndDelete(client, change)
+			await this.p4.revertAndDelete(client, change)
 		}
 		catch (err) {
 			this.edgeBotLogger.printException(err, `${userContext} - Error reverting ${change}`)
@@ -615,14 +738,15 @@ class EdgeBotImpl extends PerforceStatefulBot {
 	async _resolveChangelist(pending: PendingChange, submitRetries  = 3) : Promise<EdgeIntegrationDetails> {
 		// do a resolve with P4
 		this._log_action(`Resolving CL ${pending.change.cl} against ${this.targetBranch.name}`)
-//		const detail: ResolveResultDetail = 'detailed'
+
+		const edgeServerAddress = pending.change.edgeServerToHostShelf && pending.change.edgeServerToHostShelf.address
 
 		const result = await this.p4.resolve(
-			pending.change.targetWorkspaceOverride || this.targetBranch.workspace,
+			pending.change.targetWorkspace,
 			pending.newCl,
 			pending.action.mergeMode,
 			false, // detail === 'quick',
-			pending.change.edgeServerToHostShelf && pending.change.edgeServerToHostShelf.address
+			edgeServerAddress
 			)
 
 		if (pending.action.flags.has('manual') || pending.change.forceCreateAShelf) {
@@ -644,23 +768,49 @@ class EdgeBotImpl extends PerforceStatefulBot {
 
 			const conflicts = this.analyzeConflict(result.getConflicts())
 			if (conflicts.length > 0) {
-				failure.summary = conflicts
-					.slice(0, MAX_CONFLICTS_TO_LIST)
+				failure.details = conflicts
 					.map(({name, kind}) => `${name} (${kind} conflict)`)
 					.join('\n')
-
-				if (conflicts.length > MAX_CONFLICTS_TO_LIST) {
-					failure.summary += `\n... and ${conflicts.length - MAX_CONFLICTS_TO_LIST} more`
-				}
 			}
 		}
 		else
 		{
+			if (this.options.integrationMethod === IntegrationMethod.SKIP_IF_UNCHANGED) {
+				const opened = await this.p4.opened(pending.change.targetWorkspace, pending.newCl)
+
+				const PARALLEL_CHECKS = 25
+				let foundDiff = opened.some(x => x.action !== 'edit' && x.action !== 'integrate')
+				if (!foundDiff) {
+					const checkUnchanged = async (startIndex: number) => {
+						for (let i=startIndex; i < opened.length && !foundDiff; i += PARALLEL_CHECKS) {
+							if (await this.p4.hasDiff(pending.change.targetWorkspace, opened[i].depotFile)) {
+								foundDiff = true
+							}
+							else if (!foundDiff) { // abort if another parallel check found a diff to avoid unnecessary work
+								const fstat = (await this.p4.fstat(pending.change.targetWorkspace, opened[i].depotFile, true))[0]
+								if (fstat.headType != fstat.type) {
+									foundDiff = true
+								}
+							}
+						}
+					}
+					await Promise.all(Array.from(Array(PARALLEL_CHECKS).keys()).map(n => checkUnchanged(n)))
+				}
+				
+				if (!foundDiff) {
+					return await this.SkipIntegration(
+						pending,
+						edgeServerAddress,
+						`Skipping ${pending.change.cl} as all files are unchanged.`
+					)
+				}
+			}
+
 			if (this.options.approval) {
 				const approval = this.options.approval
 
 				// shelve
-				await this.shelveChangelist(pending, true)
+				await this.shelveChangelist(pending, {forApproval: true})
 	
 				// still notify as a 'failure' to trigger normal blockage mechanism
 				failure = { kind: 'Approval required', description: approval.description }
@@ -686,14 +836,14 @@ class EdgeBotImpl extends PerforceStatefulBot {
 					return result
 				}
 
-				let summary: string | undefined
+				let details: string | undefined
 				const match = result.message.match(/.*STDERR:([^]*)STDOUT:/)
 				if (match)
 				{
-					summary = match[1].trim()
+					details = match[1].trim()
 				}
 
-				failure = { kind: 'Commit failure', description: result.message, summary }
+				failure = { kind: 'Commit failure', description: result.message, details }
 			}
 		}
 
@@ -712,17 +862,20 @@ class EdgeBotImpl extends PerforceStatefulBot {
 	 * @param {Number} [resolveRetries=3] Number of times to catch non-fatal errors and attempt the resolve -> submit chain again.
 	 * @todo In a perfect world, parameter 'resolveRetries' wouldn't exist and an orchastration method would handle this in a loop.
 	 */
-	async submitChangelist(pending: PendingChange, resolveRetries = 3): Promise<EdgeIntegrationDetails> {
+	async submitChangelist(pending: PendingChange, resolveRetries = 3, targetServerP4?: PerforceContext): Promise<EdgeIntegrationDetails> {
 		const info = pending.change
 		const target = pending.action
 		const changenum = pending.newCl
+		const edgeServerAddress = pending.change.edgeServerToHostShelf && pending.change.edgeServerToHostShelf.address
+
+		const p4 = targetServerP4 || this.p4
 
 		// try to submit
 		this._log_action(`Submitting CL ${changenum} by ${info.author}`)
-		const result = await this.p4.submit(
-			pending.change.targetWorkspaceOverride || this.targetBranch.workspace, 
+		const result = await p4.submit(
+			pending.change.targetWorkspace, 
 			changenum,
-			pending.change.edgeServerToHostShelf && pending.change.edgeServerToHostShelf.address)
+			edgeServerAddress)
 			
 		if (typeof result === "string") {
 			// an error occurred while submitting
@@ -755,7 +908,7 @@ class EdgeBotImpl extends PerforceStatefulBot {
 			// change owner, so users can edit change descriptions later for reconsideration
 			this.edgeBotLogger.info(`Setting owner of CL ${finalCl} to author of change: ${info.author}`);
 			try {
-				await this.p4.editOwner(this.targetBranch.workspace, finalCl, info.author, {changeSubmitted: true})
+				await p4.editOwner(info.targetWorkspace, finalCl, info.author, {changeSubmitted: true, edgeServerAddress})
 			}
 			catch (reason) {
 				let errPreface = 'Error changing owner'
@@ -789,7 +942,12 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		return new EdgeIntegrationDetails('ok', finalCl)
 	}
 
-	private async shelveChangelist(pending: PendingChange, forApproval?: boolean, reason?: string) {
+	private async shelveChangelist(pending: PendingChange, shelveOpts?: {forApproval?: boolean, reason?: string, targetServerP4?: PerforceContext}) {
+
+		const forApproval: boolean = shelveOpts?.forApproval || false
+		const reason: string | undefined = shelveOpts?.reason
+		const p4 = shelveOpts?.targetServerP4 || this.p4
+
 		const changenum = pending.newCl
 		const owner = getIntegrationOwner(pending) || pending.change.author
 		this._log_action(`Shelving CL ${changenum} (change owned by ${owner})`)
@@ -809,36 +967,32 @@ class EdgeBotImpl extends PerforceStatefulBot {
 			final_desc += pending.change.additionalDescriptionText
 		}
 
-		/*if (forApproval) {
-			final_desc += "\n#review"
-		}*/
-
 		const edgeServerAddress = pending.change.edgeServerToHostShelf && pending.change.edgeServerToHostShelf.address
-		const destRoboWorkspace = pending.change.targetWorkspaceOverride || this.targetBranch.workspace
+		const destRoboWorkspace = pending.change.targetWorkspace
 
 		// abort shelve if this is a buildmachine / robomerge change (unless we are forcing the shelf)
 		let failed = false
-		if (isUserAKnownBot(owner) && !pending.change.forceCreateAShelf) {
+		if (isUserAKnownBot(owner) && !pending.change.forceCreateAShelf && !forApproval) {
 			// revert the changes locally
 			this._log_action(`Reverting shelf due to '${owner}' being a known bot`)
-			await this.p4.revert(destRoboWorkspace, changenum, undefined, edgeServerAddress)
+			await p4.revert(destRoboWorkspace, changenum, undefined, edgeServerAddress)
 			failed = true
 		}
 		else {
 			// edit the CL description
-			await this.p4.editDescription(destRoboWorkspace, changenum, final_desc, edgeServerAddress)
+			await p4.editDescription(destRoboWorkspace, changenum, final_desc, edgeServerAddress)
 
 			// shelve the files as we see them (should trigger a codereview email)
-			if (!await this.p4.shelve(destRoboWorkspace, changenum, edgeServerAddress)) {
+			if (!await p4.shelve(destRoboWorkspace, changenum, edgeServerAddress)) {
 				failed = true
 			}
 		}
 
-		if (failed) {
+		if (failed && !forApproval) {
 			// abort abort!
 			// delete the cl
 			this._log_action(`Deleting CL ${changenum}`)
-			await this.p4.deleteCl(destRoboWorkspace, changenum, edgeServerAddress)
+			await p4.deleteCl(destRoboWorkspace, changenum, edgeServerAddress)
 
 			pending.newCl = -1
 
@@ -848,7 +1002,7 @@ class EdgeBotImpl extends PerforceStatefulBot {
 
 		// revert the changes locally
 		this._log_action(`Reverting CL ${changenum} locally. (conflict owner: ${owner})`)
-		await this.p4.revert(destRoboWorkspace, changenum, [], edgeServerAddress)
+		await p4.revert(destRoboWorkspace, changenum, [], edgeServerAddress)
 
 		// figure out what workspace to put it in
 		const branch_stream = this.targetBranch.stream ? this.targetBranch.stream.toLowerCase() : undefined
@@ -860,9 +1014,24 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		// Find a suitable workspace from one of the owner's workspaces
 		else if (!forApproval) {
 			// use p4.find_workspaces to find a workspace (owned by the user) for this change if this is a stream branch
-			targetWorkspace = await p4util.chooseBestWorkspaceForUser(this.p4, owner, branch_stream)
+			const targetWorkspaceDef = await p4util.chooseBestWorkspaceForUser(p4, owner, branch_stream)
+			if (targetWorkspaceDef) {
+				targetWorkspace = targetWorkspaceDef.client
+				if (targetWorkspaceDef.Stream) {
+					pending.change.targetWorkspaceIsPartialMatch = targetWorkspaceDef.Stream.toLowerCase() == branch_stream
+				}
+				if (pending.change.targetWorkspaceIsPartialMatch) {
+					this.edgeBotLogger.info(`Chose workspace ${targetWorkspace} (${targetWorkspaceDef.Stream}) as a partial match for ${branch_stream}`)
+				}
+				else {
+					this.edgeBotLogger.info(`Chose workspace ${targetWorkspace}`)
+				}
+			}
+			else {
+				targetWorkspace = undefined
+				this.edgeBotLogger.error(`Unable to find workspace for ${branch_stream}`)
+			}
 			pending.change.targetWorkspaceForShelf = targetWorkspace
-			this.edgeBotLogger.info(`Chose workspace ${targetWorkspace}`)
 		}
 
 		// log if we couldn't find a workspace
@@ -878,7 +1047,7 @@ class EdgeBotImpl extends PerforceStatefulBot {
 
 		// edit the owner to the author so they can resolve and submit themselves
 		let shelfOwner = forApproval ? pending.change.author : owner
-		await this.p4.editOwner(destRoboWorkspace, changenum, shelfOwner, opts)
+		await p4.editOwner(destRoboWorkspace, changenum, shelfOwner, opts)
 	}
 
 	onGlobalChange(info: ChangeInfo) {
@@ -928,10 +1097,8 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		status.rootPath = this.targetBranch.rootPath
 
 		status.last_cl = this.lastCl
+		status.swarmURL = this.p4.swarmURL
 		
-		// if (this.isForceFlow)
-		status.num_changes_remaining = this.gate.numChangesRemaining
-
 		status.is_active = this.isActive
 		status.is_available = this.isAvailable
 		status.is_blocked = this.isBlocked
@@ -959,6 +1126,7 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		status.disallowSkip = this.options.disallowSkip
 		status.incognitoMode = this.options.incognitoMode
 		status.excludeAuthors = this.options.excludeAuthors
+		status.excludeDescriptions = this.options.excludeDescriptions
 
 		return status as EdgeStatusFields
 	}
@@ -971,9 +1139,13 @@ class EdgeBotImpl extends PerforceStatefulBot {
 		}
 
 		// trigger events
-		this.sourceNode.onForcedLastCl(this.displayName, value, prevValue, culprit, reason)
+		this.sourceNode.onForcedLastCl(this.displayName, this.targetBranch.upperName, value, prevValue, culprit, reason)
 		
 		return prevValue
+	}
+
+	setGateCl(value: number, culprit: string, reason: string) {
+		return this.gate.setGateCl(value, culprit, reason)
 	}
 
 	reconsider(instigator: string, changeCl: number, additionalArgs?: Partial<ReconsiderArgs>) {
@@ -999,6 +1171,7 @@ abstract class EdgeBotEntryPoints implements IPCControls {
 	acknowledge: EdgeBotImpl["acknowledge"]
 	unacknowledge: EdgeBotImpl["unacknowledge"]
 	forceSetLastClWithContext: EdgeBotImpl["forceSetLastClWithContext"]
+	setGateCl: EdgeBotImpl["setGateCl"]
 	resetIntegrationTimestamp: EdgeBotImpl["resetIntegrationTimestamp"]
 
 	// async methods
@@ -1041,6 +1214,7 @@ export class EdgeBot
 		this.acknowledge = this.proxy("acknowledge")
 		this.unacknowledge = this.proxy("unacknowledge")
 		this.forceSetLastClWithContext = this.proxy("forceSetLastClWithContext")
+		this.setGateCl = this.proxy("setGateCl")
 		this.resetIntegrationTimestamp = this.proxy("resetIntegrationTimestamp")
 
 		this.revertPendingCLWithShelf = this.proxyAsync("revertPendingCLWithShelf")
@@ -1096,6 +1270,10 @@ export class EdgeBot
 		this.impl.queueUnblock()
 	}
 
+	getWorkspace(edgeServer?: EdgeServer) {
+		return this.impl.getWorkspace(edgeServer)
+	}
+
 	/* Mirrored Variables */
 	get disallowSkip() { return this.impl.disallowSkip }
 	get incognitoMode() { return this.impl.incognitoMode }
@@ -1131,7 +1309,8 @@ export class EdgeBot
 			reconsider: this.reconsider,
 			acknowledge: this.acknowledge,
 			unacknowledge: this.unacknowledge,
-			forceSetLastClWithContext: this.forceSetLastClWithContext
+			forceSetLastClWithContext: this.forceSetLastClWithContext,
+			setGateCl: this.setGateCl
 		}
 	}
 }

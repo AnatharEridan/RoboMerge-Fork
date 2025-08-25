@@ -5,23 +5,25 @@ import * as p4util from '../common/p4util';
 import { _nextTick } from '../common/helper';
 import { ContextualLogger } from '../common/logger';
 import { Mailer, MailParams, Recipients } from '../common/mailer';
-import { Change, ConflictedResolveNFile, PerforceContext, RoboWorkspace, coercePerforceWorkspace } from '../common/perforce';
+import { Change, ConflictedResolveNFile, ExclusiveFileDetails, PerforceContext, RoboWorkspace, coercePerforceWorkspace } from '../common/perforce';
 import { IPCControls, NodeBotInterface, QueuedChange, ReconsiderArgs } from './bot-interfaces';
 import { ApprovalOptions, BotConfig, EdgeOptions, NodeOptions } from './branchdefs'
 import { BlockagePauseInfo, BranchStatus } from './status-types';
 import { AlreadyIntegrated, Blockage, Branch, BranchArg, BranchGraphInterface, ChangeInfo, EndIntegratingToGateEvent, Failure } from './branch-interfaces';
 import { MergeAction, OperationResult, PendingChange, resolveBranchArg, StompedRevision, StompVerification, StompVerificationFile, UnlockVerification }  from './branch-interfaces';
 import { Conflicts } from './conflicts';
-import { EdgeBot, EdgeMergeResults } from './edgebot';
+import { EdgeBot, EdgeIntegrationDetails, EdgeMergeResults } from './edgebot';
 import { BotEventTriggers } from './events';
-import { makeClLink, SlackMessages } from './notifications';
+import { GraphBot } from './graphbot';
+import { getPingTarget, isUserSlackGroup, makeClLink, SlackMessages } from './notifications';
 import { PerforceStatefulBot } from './perforce-stateful-bot';
+import { getExclusiveLockOpenedsToRun } from './roboargs';
 import { BlockageNodeOpUrls, OperationUrlHelper } from './roboserver';
 import { Context } from './settings';
-import { SlackMessage, SlackMessageField, SlackMessageStyles } from './slack';
+import { SlackFile, SlackMessage, SlackMessageField, SlackMessageStyles } from './slack';
 import { PauseState } from './state-interfaces';
 import { newTickJournal, TickJournal } from './tick-journal';
-import { computeTargets, parseDescriptionLines, processOtherBotTargets, getIntegrationOwner, getNodeBotFullName, getNodeBotFullNameForLogging } from './targets';
+import { computeTargets, descriptionParsers, parseDescription, processOtherBotTargets, getIntegrationOwner, getNodeBotFullName, getNodeBotFullNameForLogging } from './targets';
 import { GraphAPI } from '../new/graph';
 
 /**********************************
@@ -86,7 +88,7 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 	constructor(
 		branchDef: Branch,
-		private readonly previewMode: boolean,
+		readonly previewMode: boolean,
 		mailer: Mailer,
 		slackMessages: SlackMessages | undefined,
 		externalUrl: string, 
@@ -106,7 +108,7 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 		this.externalRobomergeUrl = externalUrl
 
-		this.p4 = new PerforceContext(this.nodeBotLogger)
+		this.p4 = PerforceContext.getServerContext(this.nodeBotLogger, branchDef.config.streamServer)
 
 		this.mailer = mailer
 
@@ -127,12 +129,6 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		)
 
 		this.initTickJournal()
-
-		if (!this.branch.workspace) {
-			throw new Error(`Branch ${this.fullName} has no valid workspace specified`)
-		}
-
-		// not looking for min CL of edges any more
 
 		// Finally after setup, create the edges. (Edges may rely on NodeBot data for setup, so always do this last.)
 		this.edges = this.createEdges()
@@ -228,7 +224,9 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			}
 		}
 		catch (err) {
-			this.nodeBotLogger.printException(err, `${this.fullName} Error while querying P4 for changes`)
+			if (err.message !== "Expected exactly one change. Got 0") {
+				this.nodeBotLogger.printException(err, `${this.fullName} Error while querying P4 for changes`)
+			}
 		}
 
 		return []
@@ -244,10 +242,10 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 	/** @return true if full tick completed, only used for analytics */
 	async tick() {
+		await Promise.all(Array.from(this.edges.values(), async edgeBot => edgeBot.tick()))
 		if (this.previewMode) {
 			return false
 		}
-		await Promise.all(Array.from(this.edges.values(), async edgeBot => edgeBot.tick()))
 
 		// Pre-tick
 
@@ -270,11 +268,19 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		let minCl = this.lastCl
 		// Gather the list of available edges for tick -- edges may change mid-tick but we will only allow this set to perform integrations
 		let availableEdges: Map<string, EdgeBot> = new Map<string, EdgeBot>()
+		let availableEdgesAtCL: Map<number, Map<string, EdgeBot>> = new Map<number, Map<string, EdgeBot>>()
+
+		// There must always be at least an empty availableEdges map at the minCl
+		availableEdgesAtCL.set(minCl, new Map<string, EdgeBot>())
 
 		this.conflicts.checkForResolvedConflicts(this.lastCl, this.edges)
 		for (const edgeBot of this.edges.values()) {
 			if (edgeBot.isAvailable) {
 				availableEdges.set(edgeBot.targetBranch.upperName, edgeBot)
+				let edgesAtCL = availableEdgesAtCL.get(edgeBot.lastCl) || new Map<string, EdgeBot>()
+				edgesAtCL.set(edgeBot.targetBranch.upperName, edgeBot)
+				availableEdgesAtCL.set(edgeBot.lastCl, edgesAtCL)
+
 				if (edgeBot.lastCl > 0 && (minCl < 0 || edgeBot.lastCl < minCl)) {
 					minCl = edgeBot.lastCl
 				}
@@ -344,7 +350,32 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			this.ticksSinceLastNewP4Commit = 0
 
 			this.headCL = changes[0].change
-			await this._processListOfChanges(availableEdges, changes)
+
+			// list of changes except reconsiders
+			const changesToProcess: Change[] = []
+
+			// process manual changes even if paused or above the lastGoodCL
+			for (const change of changes) {
+				if (change.isUserRequest) {
+					this.nodeBotLogger.debug(`Processing manual change CL ${change.change}`)
+					await this._processAndMergeCl(availableEdges, change, true)
+				}
+				else {
+					changesToProcess.push(change)
+				}
+			}
+
+			if (!this.isAvailable) {
+				this.nodeBotLogger.verbose(`Not processing changes due to unavailability.`)
+				this.nodeBotLogger.debug(`Blocked? ${this.pauseState.isBlocked()}: ${this.pauseState.blockagePauseInfo}`)
+				this.nodeBotLogger.debug(`Paused? ${this.pauseState.isManuallyPaused()}: ${this.pauseState.manualPauseInfo}`)
+				this.nodeBotLogger.debug(`Availablity? ${this.pauseState.isAvailable()}: ${this.pauseState.availableInfo}`)
+			}
+			else {
+				// make sure the list is sorted in ascending order
+				changesToProcess.sort((a, b) => a.change - b.change)
+				await Promise.all(Array.from(availableEdgesAtCL.entries()).map(async ([minCL,edgesAtCL]) => this._processListOfChanges(edgesAtCL, minCL, changesToProcess)));
+			}
 		}
 		return true
 	}
@@ -512,13 +543,19 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		const prevValue = this._forceSetLastCl_NoReset(value)
 
 		if (prevValue !== value) {
-			this.onForcedLastCl(this.displayName, value, prevValue, culprit, reason)
+			this.onForcedLastCl(this.displayName, this.branch.upperName, value, prevValue, culprit, reason)
 		}
 		return prevValue
 	}
 	
-	onForcedLastCl(nodeOrEdgeName: string, forcedCl: number, previousCl: number, culprit: string, reason: string) {
-		this.conflicts.onForcedLastCl({nodeOrEdgeName, forcedCl, previousCl, culprit, reason})
+	setGateCl(_1: number, _2: string, _3:string): Promise<number | null> {
+		const err = new Error('setGateCl not implemented on NodeBot')
+		this.nodeBotLogger.printException(err)
+		throw err
+	}
+
+	onForcedLastCl(nodeOrEdgeName: string, targetBranchUpperName: string, forcedCl: number, previousCl: number, culprit: string, reason: string) {
+		this.conflicts.onForcedLastCl({nodeOrEdgeName, sourceBranchUpperName: this.branch.upperName, targetBranchUpperName, forcedCl, previousCl, culprit, reason})
 	}
 
 	persistQueuedChanges() {
@@ -601,25 +638,32 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 	 */
 	async verifyStomp(changeCl: number, targetBranchName: string) : Promise<StompVerification> {
 		this._log_action(`Verifying stomp request of CL ${changeCl} to ${targetBranchName}`, "verbose")
+
+		const failureResult: StompVerification = {
+			success: false,
+			message: "TBD",
+			swarmURL: this.p4.swarmURL
+		}
+
 		if (!changeCl || !targetBranchName) {
-			return { success: false, message: "Missing parameters for stomp node operation" }
+			return { ...failureResult, message: "Missing parameters for stomp node operation" }
 		}
 
 		const targetBranch = this._getBranch(targetBranchName)
 
 		if (!targetBranch) {
-			return { success: false, message: `Unable to retrieve branch infomation for "${targetBranchName}". Unable to stomp, please contact Robomerge support."` }
+			return { ...failureResult, message: `Unable to retrieve branch infomation for "${targetBranchName}". Unable to stomp, please contact Robomerge support."` }
 		}
 
 		const edge = this.getImmediateEdge(targetBranch)
 
 		if (!edge) {
-			return { success: false, message: `This bot has no edge for specified branch "${targetBranch.name}" on ${this.fullName}`}
+			return { ...failureResult, message: `This bot has no edge for specified branch "${targetBranch.name}" on ${this.fullName}`}
 		}
 
 		// Ensure we're paused on a non-manual pause blockage
 		if (!edge.isBlocked) {
-			return { success: false, message: "Branch needs to have conflict to stomp changes" }
+			return { ...failureResult, message: "Branch needs to have conflict to stomp changes" }
 		}
 		
 		// Get the pause info of the edge
@@ -627,16 +671,16 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 		// We've ensured we're on a blockage now. Make sure the CL is still valid.
 		if (blockageInfo.change !== changeCl) {
-			return { success: false, message: `Requested change CL "${changeCl}" does not match blockage change CL "${blockageInfo.change}"` }
+			return { ...failureResult, message: `Requested change CL "${changeCl}" does not match blockage change CL "${blockageInfo.change}"` }
 		}
 
 		let conflict = this.conflicts.getConflictByChangeCl(changeCl, targetBranch)
 
 		if (!conflict) {
-			return { success: false, message: `Unable to retrieve conflict for CL ${changeCl} merging to ${targetBranch.name}. Unable to stomp, please contact Robomerge support.` }
+			return { ...failureResult, message: `Unable to retrieve conflict for CL ${changeCl} merging to ${targetBranch.name}. Unable to stomp, please contact Robomerge support.` }
 		}
 		if (conflict.kind === 'Exclusive check-out') {
-			return { success: false, message: `Unable to stomp changes over exclusive checkout to files in ${targetBranch.name}. ` + 
+			return { ...failureResult, message: `Unable to stomp changes over exclusive checkout to files in ${targetBranch.name}. ` + 
 				`Unable to stomp, please revert the locked files in ${targetBranch.name} or contact Robomerge support.` }
 		}
 
@@ -645,7 +689,7 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 		if (typeof blockageChangeRetrieval === 'string') {
 			return { 
-				success: false, 
+				...failureResult, 
 				message: `Unable to retrieve change infomation for given conflict. ${blockageChangeRetrieval}`
 			}
 		}
@@ -661,10 +705,11 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		const edgeMap = new Map<string, EdgeBot>([[edge.targetBranch.upperName, edge]])
 		let integratedCl: Change | null = null // Set to possible undefines as we use this in the finally clause
 		try {
-			const processResult = await this._createChangeInfo(blockageChange, edgeMap, this.p4.username, targetBranch.workspace, targetBranch)
+			const workspace = await edge.getWorkspace()
+			const processResult = await this._createChangeInfo(blockageChange, edgeMap, this.p4.username, workspace, targetBranch)
 			if (!processResult.info) {
 				return {
-					success: false, 
+					...failureResult,  
 					message: `Could not parse blockage change\nErrors: ${processResult.errors}`
 				}
 			}
@@ -678,7 +723,7 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 					message = `${message}\nErrors: ${mergeResult.errors}`
 				}
 				return { 
-					success: false, 
+					...failureResult,  
 					message
 				}
 			}
@@ -686,18 +731,18 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			const changelist = changes[0]!
 			if (changelist <= 0) {
 				return { 
-					success: false, 
+					...failureResult, 
 					message: `Unable to get integration shelf for CL ${changeCl}`
 				}
 			}
 
 			let p4ChangeResult
 			try {
-				p4ChangeResult = await this.p4.getChange( targetBranch.rootPath, changelist, 'shelved')
+				p4ChangeResult = await this.p4.getChange(changelist)
 			}
 			catch (err) {
 				return { 
-					success: false, 
+					...failureResult, 
 					message: `Unable to get integration shelf for CL ${changeCl}: ${err}`
 				}
 			}
@@ -705,9 +750,9 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			integratedCl = p4ChangeResult as Change
 
 			// Unshelve 
-			if (!await this.p4.unshelve(targetBranch.workspace, integratedCl.change)) {
+			if (!await this.p4.unshelve(workspace, integratedCl.change)) {
 				return { 
-					success: false, 
+					...failureResult,  
 					message: `Unable to unshelve CL ${integratedCl.change}`
 				}
 			}
@@ -717,13 +762,13 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 			if (!resolveResult.hasConflict()) {
 				return { 
-					success: false, 
+					...failureResult,  
 					message: `No conflict found resolving CL ${changeCl}`
 				}
 			}
 			if (!resolveResult.successfullyParsedConflicts) {
 				return { 
-					success: false, 
+					...failureResult,  
 					message: `Encountered error enumerating conflicting files after integration attempt: ${resolveResult.getParsingError()}`
 				}
 			}
@@ -751,11 +796,11 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			// We need the depot file for each conflict file to do comparisons
 			for (const remainingFile of remainingFiles) {
 				// Find target file 
-				const targetFileInDepotZtag = await this.p4.where(integratedCl.client, remainingFile.clientFile)
-				if (!targetFileInDepotZtag[0].depotFile) { 
+				const targetFileInDepot = await this.p4.where(integratedCl.client, remainingFile.clientFile)
+				if (!targetFileInDepot[0].depotFile) { 
 					throw new Error(`Error retrieving depot path for the merge target of ${remainingFile.clientFile}`)
 				}
-				remainingFile.targetDepotFile = targetFileInDepotZtag[0].depotFile
+				remainingFile.targetDepotFile = targetFileInDepot[0].depotFile
 			}
 
 			let remainingAllBinary = true
@@ -855,7 +900,8 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 				message: "TBD",
 				nonBinaryFilesResolved,
 				remainingAllBinary,
-				svFiles
+				svFiles,
+				swarmURL: this.p4.swarmURL
 			}
 
 			if (!remainingAllBinary) {
@@ -1037,10 +1083,22 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		}
 		if (conflict.kind !== 'Exclusive check-out') {
 			return { success: false, message: `Unlock only usable when edge is blocked by exclusive check-out ${targetBranch.name}. ` + 
-				`If you thinks this is an error, contact Robomerge support.` }
+				`If you think this is an error, contact Robomerge support.` }
 		}
 
-		return { success: true, validRequest: true, message: "Unlock verified", lockedFiles: blockageInfo.additionalInfo.exclusiveFiles}
+		// Verify that we have the client/user information for all locked files
+		let lockedFiles: ExclusiveFileDetails[] = blockageInfo.additionalInfo.exclusiveFiles
+		if (lockedFiles.length > getExclusiveLockOpenedsToRun()) {
+			lockedFiles = [...lockedFiles.slice(0,getExclusiveLockOpenedsToRun()), ...(await this.p4.getOpenedDetails(lockedFiles.slice(getExclusiveLockOpenedsToRun())))]
+		}
+
+		const unknownClients = lockedFiles.filter((file) => file.client.length == 0)
+		if (unknownClients.length > 0) {
+			this.logger.warn(`Unable to determine owning client for locked files:\n${unknownClients.map((file) => file.client).join("\n")}`)
+			return { success: false, message: "Unable to determine owning client for locked files" }
+		}
+
+		return { success: true, validRequest: true, message: "Unlock verified", lockedFiles}
 	}
 
 	// First, re-verify the unlock request
@@ -1071,7 +1129,20 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			filesByUser.set(lockedFile.user, [...(filesByUser.get(lockedFile.user) || []), lockedFile.depotPath])
 		}
 
-		filesByClient.forEach((files,client) => this.p4.revertFiles(files,client))
+		let results = await Promise.all(Array.from(filesByClient.entries()).map(async ([client,files]) => 
+			{ 
+				try { 
+					await this.p4.revertFiles(files,client)
+				} catch (reason) {
+					return { success: false, message: reason }
+				}
+				return { success: true }
+			}))
+		results = results.filter(result => !result.success)
+		
+		if (results.length > 0) {
+			return { success: false, message: results.map(result => result.message).join('\n') }
+		}
 
 		if (this.slackMessages) {
 			
@@ -1229,6 +1300,7 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 	applyStatus(status: BranchStatus) {
 		status.display_name = this.displayName
 		status.last_cl = this.lastCl
+		status.swarmURL = this.p4.swarmURL
 
 		status.is_active = this.isActive
 		status.is_available = this.isAvailable
@@ -1255,7 +1327,7 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		}
 
 		status.conflicts = [] as any[]
-		this.conflicts.applyStatus(status.conflicts)
+		this.conflicts.applyStatus(status.conflicts, this.slackMessages)
 
 		status.tick_count = this.tickCount
 
@@ -1453,13 +1525,18 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			return
 		}
 
-		this.nodeBotLogger.info(`Sending reconsider shelf creation (shelf CL ${pendingChange.newCl}) notification to ${pendingChange.change.owner} for source CL ${pendingChange.change.source_cl}`)
+		this.nodeBotLogger.info(`Sending shelf creation (shelf CL ${pendingChange.newCl}) notification to ${pendingChange.change.owner} for source CL ${pendingChange.change.source_cl}`)
+
+		let showStillBlockedMessage = pendingChange.change.forceCreateAShelf && !pendingChange.action.flags.has('manual')
 
 		if (this.slackMessages) {
 			let dm: SlackMessage = {
 				text: `Robomerge has created shelf CL ${pendingChange.newCl} in workspace ${pendingChange.change.targetWorkspaceForShelf} ` +
 				`for merging source CL ${pendingChange.change.source_cl} (${this.fullName}).\n` +
-				`\`\`\`${pendingChange.change.description}\`\`\``,
+				`\`\`\`${pendingChange.change.description}\`\`\`` +
+				(showStillBlockedMessage	?
+					'\n\n*Creating a shelf does not skip or unblock robomerge. It is still time sensitive that you resolve the conflict and submit, or skip the conflict.*'
+					: ''),
 				channel: '',
 				mrkdwn: true
 			}
@@ -1473,66 +1550,61 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 				new Recipients(owner),
 				`Robomerge created Shelf CL ${pendingChange.newCl} in ${pendingChange.change.targetWorkspaceForShelf}`,
 				`Robomerge has created shelf CL ${pendingChange.newCl} in workspace ${pendingChange.change.targetWorkspaceForShelf} ` +
-					`for merging source CL ${pendingChange.change.source_cl} (${this.fullName}).`,
+					`for merging source CL ${pendingChange.change.source_cl} (${this.fullName}).` +
+				showStillBlockedMessage	?
+					'\n\nCreating a shelf does not skip or unblock robomerge. It is still time sensitive that you resolve the conflict and submit, or skip the conflict.'
+					: '',
 				`${pendingChange.change.source_cl}:\n${pendingChange.change.description}`)
 		}
 	}
 
-	private async _processListOfChanges(availableEdges: Map<string, EdgeBot>, allChanges: Change[]) {
-		// list of changes except reconsiders
-		const changes: Change[] = []
-
-		// process manual changes even if paused or above the lastGoodCL
-		for (const change of allChanges) {
-			if (change.isUserRequest) {
-				this.nodeBotLogger.debug(`Processing manual change CL ${change.change}`)
-				await this._processAndMergeCl(availableEdges, change, true)
-			}
-			else {
-				changes.push(change)
+	private async getChangeAuthor(change: Change) {
+		const descriptionParser = this.branch.changelistParser && descriptionParsers.get(this.branch.changelistParser)
+		if (descriptionParser) {
+			const actualAuthor = await descriptionParser.getAuthor(change, this.nodeBotLogger)
+			if (actualAuthor) {
+				return actualAuthor
 			}
 		}
 
-		if (!this.isAvailable) {
-			this.nodeBotLogger.verbose(`Not processing changes due to unavailability.`)
-			this.nodeBotLogger.debug(`Blocked? ${this.pauseState.isBlocked()}: ${this.pauseState.blockagePauseInfo}`)
-			this.nodeBotLogger.debug(`Paused? ${this.pauseState.isManuallyPaused()}: ${this.pauseState.manualPauseInfo}`)
-			this.nodeBotLogger.debug(`Availablity? ${this.pauseState.isAvailable()}: ${this.pauseState.availableInfo}`)
-			return
+		// If the user of the CL is robomerge, lookup the actual author from the tag
+		if (change.user === "robomerge") {
+			for (const line of change.desc.split('\n')) {
+				const authorMatch = line.match("#ROBOMERGE-AUTHOR: (.*)")
+				if (authorMatch) {
+					return authorMatch[1]
+				}
+			}
+			this.nodeBotLogger.warn(`Processing change ${change.change} by user robomerge. Now: ${Date.now()} Change time: ${change.time}`)
 		}
 
-		// make sure the list is sorted in ascending order
-		changes.sort((a, b) => a.change - b.change)
+		return change.user
+	}
+
+	private async _processListOfChanges(availableEdges: Map<string, EdgeBot>, minCL: number, changes: Change[]) {
 
 		const startTime = Date.now()
 
 		for (let changeIndex = 0; changeIndex < changes.length; ++changeIndex) {
 			const change = changes[changeIndex]
-
-			// If the user of the CL is robomerge, lookup the actual author from the tag
-			if (change.user === "robomerge") {
-				let bAuthorFound = false
-				for (const line of change.desc.split('\n')) {
-					const authorMatch = line.match("#ROBOMERGE-AUTHOR: (.*)")
-					if (authorMatch) {
-						change.user = authorMatch[1]
-						bAuthorFound = true
-						break
-					}
-				}
-				if (!bAuthorFound) {
-					this.nodeBotLogger.warn(`Processing change ${change.change} by user robomerge. Now: ${Date.now()} Change time: ${change.time}`)
-				}
+			
+			if (change.change < minCL) {
+				continue
 			}
+
+			change.user = await this.getChangeAuthor(change)
+			
 			// If this is a change submitted via swarm on behalf of someone don't process the
 			// change for a few minutes to give the change owner command time to be processed
-			else if (change.client.startsWith("swarm-")) {
+			if (change.client.startsWith("swarm-")) {
 				// TODO: Use the Swarm API to lookup the actual author
 				if ((Date.now() - ((change.time || 0) * 1000)) < 120000) {
 					this.nodeBotLogger.info(`Delaying processing of ${change.change} to give swarm time to change owner.  Now: ${Date.now()} Change time: ${change.time}`)
 					return
 				}
 			}
+
+			GraphBot.checkCrashRequest(this.graphBotName)
 
 			const changeResult = await this._processAndMergeCl(availableEdges, change, false)
 
@@ -1584,16 +1656,36 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		// targets as long as all the target workspaces are on the same edge, but it will still crash if you
 		// have multiple targets with workspaces on different edgeservers
 		const numTargets = (result.info.targets || []).length;
-		let isManualChange = numTargets > 0 ? result.info.targets![0].flags.has('manual') : false;
+		const isManualChange = numTargets > 0 ? result.info.targets![0].flags.has('manual') : false;
 		if (change.forceCreateAShelf || (change.isUserRequest && !change.forceStompChanges) || isManualChange) {
 			if (!optWorkspaceOverride && numTargets == 1) {
-				result.info.targetWorkspaceForShelf = await p4util.chooseBestWorkspaceForUser(this.p4, result.info.owner||result.info.author, result.info.targets![0].branch.stream)
+				const target = result.info.targets![0]
+				const targetServerP4 = PerforceContext.getServerContext(this.logger, target.branch.config.streamServer)
+				const targetStream = target.branch.stream ? target.branch.stream.toLowerCase() : undefined
+				const targetWorkspaceDef = await p4util.chooseBestWorkspaceForUser(targetServerP4, result.info.owner||result.info.author, targetStream)
+				if (targetWorkspaceDef) {
+					result.info.targetWorkspaceForShelf = targetWorkspaceDef.client
+					if (targetWorkspaceDef.Stream) {
+						result.info.targetWorkspaceIsPartialMatch = targetWorkspaceDef.Stream.toLowerCase() != targetStream
+					}
+				}
 				optWorkspaceOverride = result.info.targetWorkspaceForShelf
-				this.nodeBotLogger.info(`Chose workspace ${optWorkspaceOverride}`)
+				if (result.info.targetWorkspaceIsPartialMatch) {
+					this.nodeBotLogger.info(`Chose workspace ${optWorkspaceOverride} (${targetWorkspaceDef!.Stream}) as a partial match for ${targetStream}`)
+				}
+				else {
+					this.nodeBotLogger.info(`Chose workspace ${optWorkspaceOverride}`)
+				}
 			}
 			if (optWorkspaceOverride) {
+				if (numTargets > 1) {	
+					const emResult = new EdgeMergeResults()
+					emResult.errors = ["Specifying a workspace override with multiple targets does not make sense"]
+					return emResult
+				}
+				const targetServerP4 = numTargets > 0 ? PerforceContext.getServerContext(this.logger, result.info.targets![0].branch.config.streamServer) : this.p4
 				// see if we need to talk to an edge server to create the shelf
-				const edgeServer = await this.p4.getWorkspaceEdgeServer(
+				const edgeServer = await targetServerP4.getWorkspaceEdgeServer(
 					coercePerforceWorkspace(optWorkspaceOverride)!.name)
 				if (edgeServer) {
 					result.info.edgeServerToHostShelf = edgeServer
@@ -1647,19 +1739,11 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			}
 
 			if (blockAssetEdges.length > 0) {
-				const describeResult = await this.p4.describe(change.change)
 
-				let changeContainsAssets = false
-				for (const entry of describeResult!.entries) {
-					const fileExtIndex = entry.depotFile.lastIndexOf('.')
-					if (fileExtIndex !== -1) {
-						const fileExt = entry.depotFile.substring(fileExtIndex + 1)
-						if (fileExt === 'uasset' || fileExt === 'umap') {
-							changeContainsAssets = true
-							break
-						}
-					}
-				}
+				let uassetSize = this.p4.sizes(`${this.branch.rootPath}.uasset@=${change.change}`, true)
+				let umapSize = this.p4.sizes(`${this.branch.rootPath}.umap@=${change.change}`, true)
+
+				const changeContainsAssets = ((await uassetSize)[0].fileCount > 0 || (await umapSize)[0].fileCount > 0)
 
 				if (changeContainsAssets) {
 					for (const [edge, action] of blockAssetEdges) {
@@ -1809,22 +1893,21 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 			}
 		}
 
-		const parse = (lines: string[]) => parseDescriptionLines({
-			lines,
+		const parseDescCommonParams = {
 			isDefaultBot: this.branch.isDefaultBot,
 			graphBotName: this.graphBotName,
 			cl: change.change,
 			aliasesUpper: this.branchGraph.config.aliases.map(s => s.toUpperCase()),
 			macros: combinedMacros,
 			logger: this.nodeBotLogger
-		})
+		}
 
-		const parsedLines = parse(change.desc.split('\n'))
+		const parsedLines = parseDescription(change.desc, {parser: this.branch.changelistParser, ...parseDescCommonParams})
 
 		const commandOverride = (change.commandOverride || '').trim()
 		if (commandOverride) {
 
-			const parsedOverride = parse(commandOverride.split('|').map(s => s.trim()))
+			const parsedOverride = parseDescription(commandOverride, {lineEnd: '|', ...parseDescCommonParams})
 			if (change.accumulateCommandOverride) {
 				parsedLines.append(parsedOverride)
 			}
@@ -1915,14 +1998,28 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 							// let ignore and disregard cancel each other out here, but don't honour ignore here so we can validate it at the bottom of the function
 							const authorIsExcluded = edgeProperties && edgeProperties.excludeAuthors && edgeProperties.excludeAuthors.indexOf(info.author) >= 0
 
-							if (!authorIsExcluded || (flags.has('disregardexcludedauthors') && !flags.has('ignore'))) {
-								mergeActions.push(action)
-							}
-							else {
+							if (authorIsExcluded && (!flags.has('disregardexcludedauthors') || flags.has('ignore'))) {
 								// skip this one
 								const skipMessage = `Skipping CL ${info.cl} due to excluded author '${info.author}'`
 								this.nodeBotLogger.info(skipMessage)
+								continue
+							}
 
+							let descriptionIsExcluded = false
+							if (edgeProperties && edgeProperties.excludeDescriptions) {
+								for (const pattern of edgeProperties.excludeDescriptions) {
+									if (info.description.search(new RegExp(pattern,"s")) >= 0) {
+										//skip this one
+										const skipMessage = `Skipping CL ${info.cl} due to excluded description pattern '${pattern}'`
+										this.nodeBotLogger.info(skipMessage)
+										descriptionIsExcluded = true
+										break
+									}
+								}
+							}
+
+							if (!descriptionIsExcluded) { //TODO: consider disregard flag
+								mergeActions.push(action)
 							}
 						}
 
@@ -1973,77 +2070,93 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 		return this.branchGraph.getBranch(name) || null;
 	}
 
+	private async _mergeClViaEdge(target: MergeAction, availableEdges: Map<string, EdgeBot>, info: ChangeInfo, ignoreEdgePauseState: boolean, mergedChanges: EdgeMergeResults) {
+		if (!this.hasEdge(target.branch)) {
+			const err = new Error(`No edge exists for target branch "${target.branch.name}"\nCurrent Edges: ${this.printEdges()}`)
+			this.nodeBotLogger.printException(err)
+			return err
+		}
+
+		const targetEdge = availableEdges.get(target.branch.upperName)
+
+		// If the edge requested is currently not available this tick, simply log that we skipped it and move on
+		if (!targetEdge) {
+			this.nodeBotLogger.verbose(`No available edges can serve CL ${info.cl} -> ${target.branch.name} this tick.`)
+			return
+		}
+
+		// Gate problem: say gate is 15, last integrated on edge was 12, incoming is 17. Edge is available because 12 < 15
+		// Note: good thing about using availability (in theory) - will not fetch loads of revisions repeatedly
+
+		// assuming ignoreEdgePauseState is false only in the regular flow, so we're good updating edge last CLs
+		if (!ignoreEdgePauseState) {
+
+			// give edge a chance to take its gate into account
+			targetEdge.preIntegrate(info.cl)
+
+			// If this edge is paused, skip it but we'll have to report it so the node doesn't advance its lastCl
+			if (!targetEdge.isAvailable) {
+				mergedChanges.markSkipped(target.branch)
+				availableEdges.delete(targetEdge.targetBranch.upperName)
+				return
+			}
+		}
+
+		// If this is not a manual change, ensure we don't tell an edge that has moved past this point to redo work
+		if (!info.userRequest && info.cl <= targetEdge.lastCl) {
+			this.nodeBotLogger.debug(`${info.cl} is behind ${targetEdge.displayName} lastCL: ${targetEdge.lastCl}`)
+			return
+		}
+
+		if (this.tickJournal) {
+			++this.tickJournal.merges
+		}
+
+		const additionalDescription = 
+		targetEdge.implicitCommands
+			.map(s => s + '\n')
+			.join('')
+
+		const integrationResult = await targetEdge.performMerge(info, target, additionalDescription)
+
+		// wake up target nodebot, so look for further merges or conflict resolutions
+		const targetNodebot = target.branch.bot as NodeBot
+		if (targetNodebot) {
+			targetNodebot.ticksSinceLastNewP4Commit = 0
+			targetNodebot.skipTickCounter = 0
+		}
+
+		// If the target edge is now blocked after the merge attempt, remove it from future merges this tick
+		if (targetEdge.isBlocked) {
+			this.nodeBotLogger.info(`${targetEdge.displayName} is blocked after attempting to merge ${info.cl}, removing edge from merges this tick.`)
+			availableEdges.delete(targetEdge.targetBranch.upperName)
+		}
+
+		mergedChanges.addIntegrationResult(target, integrationResult)
+
+		return integrationResult
+	}
+
 	private async _mergeClViaEdges(availableEdges: Map<string, EdgeBot>, info: ChangeInfo, ignoreEdgePauseState: boolean) : Promise<EdgeMergeResults> {
+
 		const mergedChanges = new EdgeMergeResults()
+		const mergeResults = await Promise.all(info.targets!.map(async (target) => this._mergeClViaEdge(target, availableEdges, {...info}, ignoreEdgePauseState, mergedChanges)))
 
-		for (const target of info.targets!) {
-			if (!this.hasEdge(target.branch)) {
-				const err = new Error(`No edge exists for target branch "${target.branch.name}"\nCurrent Edges: ${this.printEdges()}`)
-				this.nodeBotLogger.printException(err)
-				throw err
+		let workDone = false
+		for (const mergeResult of mergeResults) {
+			if (mergeResult instanceof Error) {
+				throw mergeResult
 			}
-
-			const targetEdge = availableEdges.get(target.branch.upperName)
-
-			// If the edge requested is currently not available this tick, simply log that we skipped it and move on
-			if (!targetEdge) {
-				this.nodeBotLogger.verbose(`No available edges can serve CL ${info.cl} -> ${target.branch.name} this tick.`)
-				continue
-			}
-
-			// Gate problem: say gate is 15, last integrated on edge was 12, incoming is 17. Edge is available because 12 < 15
-			// Note: good thing about using availability (in theory) - will not fetch loads of revisions repeatedly
-
-			// assuming ignoreEdgePauseState is false only in the regular flow, so we're good updating edge last CLs
-			if (!ignoreEdgePauseState) {
-
-				// give edge a change to take its gate into account
-				targetEdge.preIntegrate(info.cl)
-
-				// If this edge is paused, skip it but we'll have to report it so the node doesn't advance its lastCl
-				if (!targetEdge.isAvailable) {
-					mergedChanges.markSkipped(target.branch)
-					availableEdges.delete(targetEdge.targetBranch.upperName)
-					continue
+			else if (mergeResult instanceof EdgeIntegrationDetails) {
+				if (mergeResult.result !== 'nothing to do') {
+					workDone = true
 				}
 			}
+		}
 
-			// If this is not a manual change, ensure we don't tell an edge that has moved past this point to redo work
-			if (!info.userRequest && info.cl <= targetEdge.lastCl) {
-				this.nodeBotLogger.debug(`${info.cl} is behind ${targetEdge.displayName} lastCL: ${targetEdge.lastCl}`)
-				continue
-			}
-
-			if (this.tickJournal) {
-				++this.tickJournal.merges
-			}
-
-			const additionalDescription = 
-				targetEdge.implicitCommands
-					.map(s => s + '\n')
-					.join('')
-
-			const integrationResult = await targetEdge.performMerge(info, target, this.branch.convertIntegratesToEdits, additionalDescription)
-
-			// wake up target nodebot, so look for further merges or conflict resolutions
-			const targetNodebot = target.branch.bot as NodeBot
-			if (targetNodebot) {
-				targetNodebot.ticksSinceLastNewP4Commit = 0
-				targetNodebot.skipTickCounter = 0
-			}
-
-			// If the target edge is now blocked after the merge attempt, remove it from future merges this tick
-			if (targetEdge.isBlocked) {
-				this.nodeBotLogger.info(`${targetEdge.displayName} is blocked after attempting to merge ${info.cl}, removing edge from merges this tick.`)
-				availableEdges.delete(targetEdge.targetBranch.upperName)
-			}
-
-			mergedChanges.addIntegrationResult(target, integrationResult)
-
-			// if integration did something, enough time has probably passed to make worth checking to see if any manual requests came in
-			if (integrationResult.result !== 'nothing to do') {
-				await this.postIntegrate()
-			}
+		// if integration did something, enough time has probably passed to make worth checking to see if any manual requests came in
+		if (workDone) {
+			await this.postIntegrate()
 		}
 
 		return mergedChanges
@@ -2112,8 +2225,8 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 			let message = `While reconsidering CL#${pending.change.cl}`
 
-			if (failure.summary) {
-				message += '\n' + failure.summary 
+			if (failure.details) {
+				message += '\n' + failure.details 
 			}
 			else
 			{
@@ -2122,6 +2235,12 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 			if (postIntegrate && pending.change.targetWorkspaceForShelf) {
 				message += `\n\nShelved ${pending.newCl} in workspace ${pending.change.targetWorkspaceForShelf}`
+
+				if (pending.change.targetWorkspaceIsPartialMatch) {
+					message += `\n\n*NOTE: The target workspace was not an exact match for the shelved files. `
+					message += "You may need to remap the workspace to the target stream, move the files to "
+					message += "another workspace, or create a workspace for these files and reconsider again.*"
+				}
 			}
 
 			if (this.slackMessages) {
@@ -2135,6 +2254,15 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 				
 				let emailAddress = await this.findEmail(owner)
 				this.slackMessages.postDM(emailAddress, pending.newCl, this.branch, dm)
+
+				if (failure.details) {
+					let file: SlackFile = {
+						content: failure.details,
+						channels: "",
+						filename: "failuredetails.txt"
+					}
+					this.slackMessages.postFileToDM(emailAddress, pending.newCl, this.branch, file)
+				}				
 			}
 			else {
 				this.sendErrorEmail(new Recipients(owner), shortMessage, message)
@@ -2171,18 +2299,24 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 
 	async reportApprovalRequired(approval: ApprovalOptions, pending: PendingChange) {
 		if (this.slackMessages) {
-			const userEmail = await this.p4.getEmail(pending.change.author)
-			const slackUser = userEmail ? await this.slackMessages.getSlackUser(userEmail) : null
-			const channelPing = slackUser ? `<@${slackUser}>` : `@${pending.change.author}`
+			const authorEmail = await this.p4.getEmail(pending.change.author)
+			const slackAuthor = authorEmail ? await this.slackMessages.getSlackUser(authorEmail) : null
+			const ownerEmail = pending.change.owner && pending.change.owner != pending.change.author ? await this.p4.getEmail(pending.change.owner) : null
+			const slackOwner = ownerEmail ?  await this.slackMessages.getSlackUser(ownerEmail) : null
 
 			const fields: SlackMessageField[] = [
-				{title: 'Change', short: true, value: makeClLink(pending.newCl)}
+				{title: 'Shelved Change', short: true, value: makeClLink(pending.newCl)}
 			]
+
+			let message = (slackAuthor ? `<@${slackAuthor}>` : `@${pending.change.author}`) +
+						  "'s change " +
+						  (ownerEmail ? "owned by " + (slackOwner ? `<@${slackOwner}> ` : `@${pending.change.owner} `) : "") +
+						  `in ${pending.action.branch.name} needs to be approved.\n\n` +
+						  approval.description
 
 			const opts: SlackMessage = { 
 				title:'', 
-				text: `${channelPing}'s change in ${pending.action.branch.name} needs to be approved.\n\n` +
-						approval.description, 
+				text: message, 
 				style: SlackMessageStyles.DANGER, 
 				fields,
 				mrkdwn: true,
@@ -2260,7 +2394,7 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 				
 						let triager = getNagProperty("triager")
 
-						if (triager && !triager.startsWith('@'))
+						if (triager && !isUserSlackGroup(triager))
 						{
 							const emailAddress = await this.findEmail(triager)
 							if (emailAddress)
@@ -2280,14 +2414,16 @@ export class NodeBot extends PerforceStatefulBot implements NodeBotInterface {
 							}
 						}
 
+						const channelPing = await getPingTarget(await this.p4.getEmail(conflict.owner), conflict.owner, this.slackMessages)
+
 						const nagMessage: SlackMessage = {
-							text: `${triager ? triager + ' ' : ''}RoboMerge blocked for more than ${timeDesc}`,
+							text: `${triager ? triager + ' ' : ''}${channelPing} RoboMerge blocked for more than ${timeDesc}`,
 							style: SlackMessageStyles.DANGER,
 							channel: this.branchGraph.config.slackChannel,
 							mrkdwn: true
 						}
 
-						this.nodeBotLogger.info(`Sending nag notification to ${conflict.owner} after ${Math.floor(ageMinutes)} minutes`)
+						this.nodeBotLogger.info(`Sending nag notification to ${triager ? triager + ' and ' : ''}${conflict.owner} after ${Math.floor(ageMinutes)} minutes`)
 						const branchName =  (conflict.kind === "Syntax error" ? conflict.kind : conflict.targetBranchName || conflict.blockedBranchName)
 						this.slackMessages.postReply(conflict.cl, branchName, nagMessage)
 					}

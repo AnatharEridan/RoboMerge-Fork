@@ -98,22 +98,22 @@ for both node and edge.
 |`depot`                    |n |**required**| |Depot, e.g. UE4                          |Flag currently called `defaultStreamDepot`|
 |`rootPath`                 |n |from stream | |P4 depot full path                       | |
 |`streamSubpath`            |n |`/...`      | |P4 depot sub-path                        | |
-|`workspaceNameOverride`    |n |            | |Used specified workspace name for commits| |
 |`enabled`                  |ne|`true`      | |If false, pretends node/edge doesn't exist| |
 |`forcePause`               |ne|            | |If flag set, pause - applies each restart| |
 |`additionalSlackChannelForBlockages` |e |  | |Single extra Slack channel               | |
 |`blockAssetFlow`           |n |`[]`        | |Reject any integrations containing assets to these targets   | |
-|`defaultIntegrationMethod` |e |normal      | |For edigrate                             | |
+|`integrationMethod`        |e |normal      | |For skip if unchanged                    | |
 |`disallowSkip`             |e |            | |Remove skip option from UI               | |
 |`emailOnBlockage`          |e |`true`      | |Email owners of conflicts?               | |
 |`excludeAuthors`           |e |            | |Skip changes by these authors, e.g. skip `buildmachine` commits| |
+|`excludeDescriptions`      |e |            | |Skip changes that contain these patterns in their description| |
 |`ignoreBranchspecs`        |e |            | |Where branchspecs specified, ignore for this edge| |
 |`incognitoMode`            |e |`false`     | |Terse description in committed changelists| |
 |`initialCL`                |e |            | |First run only: which CL start _after_   | |
 |`isDefaultBot`             |e |`false`     | |Run plain #robomerge commands? Should be `false` for streams monitored by multiple bots| |
 |`lastGoodCLPath`           |e |            | |'Gate' file to read to find CIS-approved CL| |
 |`waitingForCISLink`        |e |            | |URL to link to for waiting for CIS messages| |
-|`maxFilesPerIntegration`   |e |`-1`        | |Reject integrations with more files than this| |
+|`workspaceNameOverride`    |e |            | |User specified workspace name for commits| |
 |`notify`                   |e |            | |Additional people to email on blockages  |Also `globalNotify`|
 |`resolver`                 |e |            | |Single designated resolver               |Currently applies to both source and target nodes|
 
@@ -152,8 +152,8 @@ Dis-allow integration between 5am and 9pm UTC
 The last line of `helix.Dockerfile` contains the version number. The version is also used in `docker-build.sh` and should be updated there:
 
 ```
-HELIX_DOCKER_IMAGE_NAME=${DOCKER_REGISTRY_DOMAIN}/${DOCKER_REGISTRY_NAMESPACE}/helix:2021.1
-HELIX_AND_NODE_DOCKER_IMAGE_NAME=${DOCKER_REGISTRY_DOMAIN}/${DOCKER_REGISTRY_NAMESPACE}/helix-and-node:2021.1
+HELIX_DOCKER_IMAGE_NAME=${DOCKER_REGISTRY_DOMAIN}/${DOCKER_REGISTRY_NAMESPACE}/helix:2022.1
+HELIX_AND_NODE_DOCKER_IMAGE_NAME=${DOCKER_REGISTRY_DOMAIN}/${DOCKER_REGISTRY_NAMESPACE}/helix-and-node:2022.1
 ```
 
 #### NodeJS/Typescript
@@ -169,9 +169,9 @@ Typescript 5.0
 If either of these docker files and modified, a new version of the image should be built and pushed to the Docker Hub. In the Epic internal case, for example:
 
 ```
-docker build -f helix.Dockerfile -t helix
-docker tag helix hub.ol.epicgames.net/epicgames/helix:2021.1
-docker push hub.ol.epicgames.net/epicgames/helix:2021.1
+docker build -f helix.Dockerfile -t helix .
+docker tag helix hub.ol.epicgames.net/epicgames/helix:2022.1
+docker push hub.ol.epicgames.net/epicgames/helix:2022.1
 ```
 
 Note that both the `helix` and `helix-and-node` images use the Helix version as their version.

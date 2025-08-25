@@ -3,7 +3,7 @@
 import { setDefault } from '../common/helper';
 import { BranchSpec } from '../common/perforce';
 import { Branch, BranchGraphInterface, EditableBranch } from './branch-interfaces';
-import { BotConfig, BranchDefs, BranchGraphDefinition, EdgeOptions, EdgeProperties, IntegrationMethod } from './branchdefs';
+import { BotConfig, BranchDefs, BranchGraphDefinition, EdgeOptions, EdgeProperties } from './branchdefs';
 import { NodeOptions, calculateStream } from './branchdefs';
 
 type ConfigBlendMode = 'override' | 'accumulate'
@@ -54,6 +54,7 @@ if (botname === '__TEST__') {
 	private propagateBotPropertiesToNodes() {
 		const propertiesToPropagate: [keyof BotConfig, keyof NodeOptions, ConfigBlendMode | null][] = [
 			['excludeAuthors', 'excludeAuthors', 'override'],
+			['excludeDescriptions', 'excludeDescriptions', 'override'],
 			['badgeUrlOverride', 'badgeUrlOverride', 'override']
 		]
 
@@ -81,13 +82,14 @@ if (botname === '__TEST__') {
 	private propagateSourcePropertiesToEdges() {
 		// also flag for applying reverse entry too? would apply to branchspecs, not so simple for resolver
 		const propertiesToPropagate: [keyof NodeOptions, keyof EdgeOptions, ConfigBlendMode | null][] = [
-			['additionalSlackChannelForBlockages', 'additionalSlackChannel', null],
+			['additionalSlackChannelForBlockages', 'additionalSlackChannel', 'override'],
 			['postMessagesToAdditionalChannelOnly', 'postOnlyToAdditionalChannel', null],
 			['lastGoodCLPath', 'lastGoodCLPath', null],
 			['waitingForCISLink', 'waitingForCISLink', null],
 			['disallowSkip', 'disallowSkip', null],
 			['incognitoMode', 'incognitoMode', null],
 			['excludeAuthors', 'excludeAuthors', 'override'],
+			['excludeDescriptions', 'excludeDescriptions', 'override'],
 			['integrationWindow', 'integrationWindow', null],
 			['invertIntegrationWindow', 'invertIntegrationWindow', null],
 		]
@@ -208,8 +210,8 @@ if (botname === '__TEST__') {
 		this.finish()
 	}
 
-	private static _getBoolConfig(fromOptions?: boolean, fromConfig?: boolean): boolean {
-		return !!(fromOptions === undefined ? fromConfig : fromOptions)
+	private static _getConfig<Type>(fromOptions?: Type, fromConfig?: Type): Type | undefined {
+		return (fromOptions === undefined ? fromConfig : fromOptions)
 	}
 
 	private add(name: string, options: NodeOptions) {
@@ -220,7 +222,6 @@ if (botname === '__TEST__') {
 		let branch: EditableBranch = {
 			name: name,
 			parent: this,
-			workspace: options.workspace || null,
 			branchspec: new Map<string, BranchSpec>(),
 			edgeProperties: new Map(),
 			upperName: nameUpper,
@@ -228,9 +229,10 @@ if (botname === '__TEST__') {
 			config: options,
 			depot: "", // will compute
 			rootPath: options.rootPath || "",
+			uniqueBranch: options.uniqueBranch || false,
 			badgeProject: options.badgeProject || null,
-			isDefaultBot: BranchGraph._getBoolConfig(options.isDefaultBot, this.config.isDefaultBot),
-			emailOnBlockage: BranchGraph._getBoolConfig(options.emailOnBlockage, this.config.emailOnBlockage),
+			isDefaultBot: !!BranchGraph._getConfig(options.isDefaultBot, this.config.isDefaultBot),
+			emailOnBlockage: !!BranchGraph._getConfig(options.emailOnBlockage, this.config.emailOnBlockage),
 			flowsTo: options.flowsTo || [],
 			notify: (options.notify || []).concat(this.config.globalNotify),
 			forceFlowTo: [], // will compute
@@ -239,15 +241,18 @@ if (botname === '__TEST__') {
 			blockAssetTargets: new Set<string>(),
 			enabled: !options.disabled,
 			allowDeadend: !options.disallowDeadend,
+			changelistParser: BranchGraph._getConfig(options.changelistParser, this.config.changelistParser) || null,
 			resolver: options.resolver || null,
 			triager: options.triager || null,
 			nagSchedule: options.nagSchedule || null,
 			nagAcknowledgedSchedule: options.nagAcknowledgedSchedule || null,
 			nagAcknowledgedLeeway: options.nagAcknowledgedLeeway || null,
 			nagWhenBlocked: options.nagWhenBlocked || null,
-			convertIntegratesToEdits: (options.integrationMethod || this.config.defaultIntegrationMethod) === IntegrationMethod.CONVERT_TO_EDIT,
 			visibility: options.visibility || this.config.visibility,
 			get isMonitored() { return !!(this.bot && this.bot.isRunning) }
+		}
+		if (branch.changelistParser) {
+			import(`./changelistparsers/${branch.changelistParser}`)
 		}
 
 		// non-enumerable properties so they don't get logged

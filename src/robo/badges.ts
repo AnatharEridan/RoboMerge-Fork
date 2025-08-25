@@ -52,7 +52,7 @@ class BadgeHandler implements BotEventHandler {
 		this.externalUrl = externalUrl
 
 		this.badgeHandlerLogger = parentLogger.createChild('BadgeHandler')
-		this.p4 = new PerforceContext(this.badgeHandlerLogger)
+		this.p4 = PerforceContext.getServerContext(this.badgeHandlerLogger)
 	}
 
 	/** See if this change implies badges should be added or updated */
@@ -193,7 +193,7 @@ async function markViaBranches(viaClStrings: string[], badgeFunc: BadgeFunc, bra
 
 		let result
 		try {
-			result = await p4.getChange(`//${branchGraph.config.defaultStreamDepot}/...`, cl)
+			result = await p4.getChange(cl)
 		}
 		catch (err) {
 			// this can fail sometimes with cross depot integrations

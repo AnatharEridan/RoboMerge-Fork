@@ -3,8 +3,7 @@
 import * as Sentry from '@sentry/node';
 import { ContextualLogger } from '../common/logger';
 import { Mailer } from '../common/mailer';
-import * as p4util from '../common/p4util';
-import { PerforceContext, Workspace, StreamSpecs } from '../common/perforce';
+import { PerforceContext } from '../common/perforce';
 import { AutoBranchUpdater } from './autobranchupdater';
 import { bindBadgeHandler } from './badges';
 import { Bot } from './bot-interfaces';
@@ -13,7 +12,6 @@ import { BotConfig, BranchDefs, BranchGraphDefinition } from './branchdefs';
 import { BranchGraph } from './branchgraph';
 import { PersistentConflict } from './conflict-interfaces';
 import { BotEventHandler, BotEventTriggers } from './events';
-import { GraphInterface } from './graph-interface';
 import { NodeBot } from './nodebot';
 import { bindBotNotifications, BotNotifications, NOTIFICATIONS_PERSISTENCE_KEY } from './notifications';
 import { postMessageToChannel, postToRobomergeAlerts, SlackMessages } from './notifications';
@@ -24,12 +22,13 @@ import { Status } from './status';
 import { GraphBotState } from "./status-types"
 import { TickJournal } from './tick-journal';
 import { GraphAPI } from '../new/graph';
+import * as p4util from '../common/p4util';
 
 // probably get the gist after 2000 characters
 const MAX_ERROR_LENGTH_TO_REPORT = 2000
 
 export type ReloadListeners = (graphBot: GraphBot, logger: ContextualLogger) => void
-export class GraphBot implements GraphInterface, BotEventHandler {
+export class GraphBot implements BotEventHandler {
 	static dataDirectory: string
 	branchGraph: BranchGraph
 	filename: string
@@ -44,54 +43,60 @@ export class GraphBot implements GraphInterface, BotEventHandler {
 
 	private p4: PerforceContext;
 
-	constructor(botname: string, private mailer: Mailer, private externalUrl: string, allStreamSpecs: StreamSpecs) {
+	private constructor(private mailer: Mailer, private externalUrl: string) {
+	}
+
+	static async CreateAsync(botname: string, mailer: Mailer, externalUrl: string) {
+		let graphBot = new GraphBot(mailer, externalUrl)
+
 		if (!GraphBot.dataDirectory) {
 			throw new Error('Data directory must be set before creating a BranchGraph')
 		}
 
-		this.botLogger = new ContextualLogger(botname.toUpperCase())
-		this.p4 = new PerforceContext(this.botLogger)
+		graphBot.botLogger = new ContextualLogger(botname.toUpperCase())
+		graphBot.p4 = PerforceContext.getServerContext(graphBot.botLogger)
 
-		this.branchGraph = new BranchGraph(botname)
-		this.filename = botname + '.branchmap.json'
+		graphBot.branchGraph = new BranchGraph(botname)
+		graphBot.filename = botname + '.branchmap.json'
 
-		const branchSettingsPath = `${GraphBot.dataDirectory}/${this.filename}`
+		const branchSettingsPath = `${GraphBot.dataDirectory}/${graphBot.filename}`
 
-		this.botLogger.info(`Loading branch map from ${branchSettingsPath}`)
+		graphBot.botLogger.info(`Loading branch map from ${branchSettingsPath}`)
 		const fileText = require('fs').readFileSync(branchSettingsPath, 'utf8')
 
-		const validationErrors: string[] = []
-		const result = BranchDefs.parseAndValidate(validationErrors, fileText, allStreamSpecs)
+		const result = await BranchDefs.parseAndValidate(graphBot.botLogger, fileText)
 		if (!result.branchGraphDef) {
-			throw new Error(validationErrors.length === 0 ? 'Failed to parse' : validationErrors.join('\n'))
+			throw new Error(result.validationErrors.length === 0 ? 'Failed to parse' : result.validationErrors.join('\n'))
 		}
 
-		this.branchGraph.config = result.config
+		graphBot.branchGraph.config = result.config
 
 		let error: string | null = null
 		try {
-			this.branchGraph._initFromBranchDefInternal(result.branchGraphDef)
+			graphBot.branchGraph._initFromBranchDefInternal(result.branchGraphDef)
 		}
 		catch (exc) {
 			// reset - don't keep a partially configured bot around
-			this.branchGraph = new BranchGraph(botname)
-			this.branchGraph.config = result.config
-			this.branchGraph._initFromBranchDefInternal(null)
+			graphBot.branchGraph = new BranchGraph(botname)
+			graphBot.branchGraph.config = result.config
+			graphBot.branchGraph._initFromBranchDefInternal(null)
 			error = exc.toString();
 		}
 
 		if (!result.branchGraphDef) {
-			error = validationErrors.length === 0 ? 'Failed to parse' : validationErrors.join('\n');
+			error = result.validationErrors.length === 0 ? 'Failed to parse' : result.validationErrors.join('\n');
 		}
 
 		// start empty bot on error - can be fixed up by branch definition check-in
 		if (error) {
-			this.botLogger.error(`Problem starting up bot ${botname}: ${error}`);
+			graphBot.botLogger.error(`Problem starting up bot ${botname}: ${error}`);
 		}
 
-		this.settings = new Settings(botname, this.branchGraph, this.botLogger, this.p4)
+		graphBot._settings = new Settings(botname, graphBot.branchGraph, graphBot.botLogger, graphBot.p4)
 
-		this.externalUrl = externalUrl
+		graphBot.externalUrl = externalUrl
+
+		return graphBot
 	}
 
 	findNode(branchname: BranchArg): NodeBot | undefined {
@@ -173,26 +178,24 @@ export class GraphBot implements GraphInterface, BotEventHandler {
 		}
 
 		delete this.lastError
+		GraphBot.crashRequests.delete(this.branchGraph.botname)
 
 		const msg = `${who} restarted bot ${this.branchGraph.botname}`
 		this.botLogger.info(msg)
 		postToRobomergeAlerts(msg)
 
-		if (this.branchGraph.branches.length !== 0) {
-			const workspaces = this.branchGraph.branches.map(branch => 
-				[(branch.workspace as Workspace).name || (branch.workspace as string),
-				branch.rootPath]) as [string, string][]
-			const mirrorWorkspace = AutoBranchUpdater.getMirrorWorkspace(this)
-			if (mirrorWorkspace) {
-				// add /... to match branches' rootPath format
-				workspaces.push([mirrorWorkspace.name, mirrorWorkspace.stream + '/...'])
-			}
-
-			this.botLogger.info('Cleaning all workspaces')
-			await p4util.cleanWorkspaces(this.p4, workspaces)
-		}
+		this.botLogger.info('Marking workspaces to be recleaned')
+		await p4util.clearCleanedWorkspaces(this.branchGraph.botname)
 
 		await this.startBotsAsync()
+	}
+
+	static checkCrashRequest(botname: string) {
+		// crashMe API support - simulate a bot crashing and stopping the GraphBot instance
+		const crashRequested = this.crashRequests.get(botname)
+		if (crashRequested) {
+			throw new Error(crashRequested)
+		}
 	}
 
 	// Don't call this unless you want to bring down the entire GraphBot in a crash!
@@ -200,7 +203,7 @@ export class GraphBot implements GraphInterface, BotEventHandler {
 		const msg = `${who} has requested a crash for bot ${this.branchGraph.botname}`
 		this.botLogger.warn(msg)
 		await postMessageToChannel(msg, this.branchGraph.config.slackChannel)
-		this.crashRequested = msg
+		GraphBot.crashRequests.set(this.branchGraph.botname, msg)
 	}
 
 	async handleRequestedIntegrationsForAllNodes(): Promise<[NodeBot, Error] | null> {
@@ -279,16 +282,19 @@ export class GraphBot implements GraphInterface, BotEventHandler {
 
 			const startTime = Date.now()
 
-			let tickBot = async function(bot: Bot, crashRequested: string|null): Promise<[Bot,boolean|Error]> {		
+			let tickBot = async function(bot: Bot): Promise<[Bot,boolean|Error]> {		
 				bot.isActive = true
 				let ticked = false
 				try {
-					// crashMe API support - simulate a bot crashing and stopping the GraphBot instance
-					if (crashRequested) {
-						throw new Error(crashRequested)
+					if (bot instanceof NodeBot) {
+						GraphBot.checkCrashRequest(bot.branchGraph.botname)
 					}
 
 					ticked = await bot.tick()
+
+					if (bot instanceof NodeBot) {
+						GraphBot.checkCrashRequest(bot.branchGraph.botname)
+					}
 				}
 				catch (err) {
 					return [bot,err]
@@ -307,7 +313,7 @@ export class GraphBot implements GraphInterface, BotEventHandler {
 
 			// The autoupdater needs to fully run before we parallelize the remaining bots
 			if (this.autoUpdater) {
-				const [_, autoUpdateResult] = await tickBot(this.autoUpdater, null)
+				const [_, autoUpdateResult] = await tickBot(this.autoUpdater)
 				if (typeof autoUpdateResult !== 'boolean') {
 					this.handleNodebotError(this.autoUpdater, autoUpdateResult)
 					return
@@ -321,9 +327,7 @@ export class GraphBot implements GraphInterface, BotEventHandler {
 				}
 			}
 
-			const tickResults = await Promise.all(this.botlist.map(async (bot, index) => tickBot(bot, index == 0 ? this.crashRequested : null)));
-
-			this.crashRequested = null
+			const tickResults = await Promise.all(this.botlist.map(async (bot) => tickBot(bot)));
 			
 			let botCrashed = false
 			for (const [bot, result] of tickResults)
@@ -495,14 +499,18 @@ export class GraphBot implements GraphInterface, BotEventHandler {
 		}
 	}
 
-	readonly settings: Settings
+	private _settings: Settings
+
+	get settings() {
+		return this._settings;
+	}
 	private botlist: Bot[] = []
 	private waitTime?: number
 
 	private _runningBots = false
 	private lastError?: {nodeBot: string, error: string}
-	private timeout: NodeJS.Timer | null = null
+	private timeout: ReturnType<typeof setTimeout> | null = null
 	private _shutdownCb: Function | null = null
 
-	private crashRequested: string | null = null
+	private static crashRequests: Map<string, string> = new Map()
 }

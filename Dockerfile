@@ -1,5 +1,5 @@
 # Copyright Epic Games, Inc. All Rights Reserved.
-FROM node:20-bookworm
+FROM helix-and-node
 
 # configure for Epic's p4 server
 ENV P4PORT=perforce:1666
@@ -25,6 +25,10 @@ RUN mkdir -p /root/.robomerge
 
 # expose the robomerge web page
 EXPOSE 8080 4433
+
+# dump versions for easy viewing
+RUN echo Node $(node -v)
+RUN echo Typescript $(tsc -v)
 
 # install dependencies
 COPY ./package.json ./
@@ -53,9 +57,5 @@ COPY ./email_templates ./email_templates
 
 # Copy markdown files
 COPY ./*.md ./
-
-# dump versions for easy viewing
-RUN echo Node $(node -v)
-RUN echo Typescript $(tsc -v)
 
 CMD [ "node", "--require", "source-map-support/register", "dist/robo/watchdog.js" ]

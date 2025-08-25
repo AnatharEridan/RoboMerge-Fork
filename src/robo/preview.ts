@@ -5,7 +5,6 @@ import { PerforceContext } from '../common/perforce';
 import { Status } from './status';
 
 const logger = new ContextualLogger('preview')
-let p4: PerforceContext | null = null
 
 // let branchSpecsRootPath = ''
 export function init(_root: string) {
@@ -13,12 +12,10 @@ export function init(_root: string) {
 }
 
 export async function getPreview(cl: number, singleBot?: string) {
-	// @todo print content from shelf
-	if (!p4) {
-		p4 = new PerforceContext(logger)
-	}
 
-	const status = new Status(new Date(), 'preview', logger)
+	let p4 = PerforceContext.getServerContext(logger)
+
+	const status = new Status(new Date(), `preview:${p4.swarmURL}/changes/${cl}`, logger)
 
 	const bots: [string, string][] = []
 	for (const entry of (await p4.describe(cl, undefined, true)).entries) {
@@ -30,8 +27,6 @@ export async function getPreview(cl: number, singleBot?: string) {
 		}
 	}
 
-	const allStreamSpecs = await p4.streams()
-
 	const errors = []
 	for (const [bot, path] of bots) {
 		if (singleBot && bot.toLowerCase() !== singleBot.toLowerCase()) {	
@@ -39,17 +34,22 @@ export async function getPreview(cl: number, singleBot?: string) {
 		}
 		const fileText = await p4.print(`${path}@=${cl}`)
 
-		let validationErrors: string[] = []
-		const result = BranchDefs.parseAndValidate(validationErrors, fileText, allStreamSpecs, true)
+		const result = await BranchDefs.parseAndValidate(logger, fileText, true)
 
 		const errorPrefix = `\n\t${bot} validation failed: `
+		if (result.validationWarnings.length == 1) {
+			status.addWarning(errorPrefix + result.validationWarnings[0])
+		} else if (result.validationWarnings.length > 1) {
+			status.addWarning(errorPrefix + result.validationWarnings.map(warn => `\n\t\t${warn}`).join(''))
+		}
+
 		if (!result.branchGraphDef) {
-			if (validationErrors.length == 0) {
+			if (result.validationErrors.length == 0) {
 				errors.push(errorPrefix + 'unknown error')
-			} else if (validationErrors.length == 1) {
-				errors.push(errorPrefix + validationErrors[0])
+			} else if (result.validationErrors.length == 1) {
+				errors.push(errorPrefix + result.validationErrors[0])
 			} else {
-				errors.push(errorPrefix + validationErrors.map(err => `\n\t\t${err}`).join(''))
+				errors.push(errorPrefix + result.validationErrors.map(err => `\n\t\t${err}`).join(''))
 			}
 			continue
 		}
@@ -70,7 +70,13 @@ export async function getPreview(cl: number, singleBot?: string) {
 	}
 
 	if (errors.length > 0) {
-		throw new Error(errors.join('\n\n'))
+		let error = errors.join('\n\n')
+		const warnings = status.getWarnings()
+		if (warnings.length > 0) {
+			error += '\n\nWarning:'
+			error += status.getWarnings().map(warning => `${warning}`).join('\n\n')
+		}
+		throw new Error(error)
 	}
 	return status
 }

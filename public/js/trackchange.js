@@ -1,43 +1,32 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 "use strict"
 
-function getMergeMethodString(mergeMethod) {
+function getMergeMethodStyle(mergeMethod) {
 	switch(mergeMethod) {
 		case "automerge":
-			return "Automerge"
+			return {color: "black", style: "solid"}
 		case "initialSubmit":
-			return ""
+			console.log("Unexpected mergeMethod of initialSubmit")
+			return {color: "pink", style: "solid"}
 		case "merge_with_conflict":
-			return "Merge w/ conflict"
+			return {color: "red", style: "dashed"}
 		case "manual_merge":
-			return "Manual merge"
+			return {color: "darkgray", style: "dashed"}
 		case "populate":
-			return "Populate"
+			return {color: "blue", style: "dashed"}
+		case "transfer":
+			return {color: "orange", style: "solid"}
 	}
-	return "UNKNOWN CASE: " + mergeMethod
-}
-
-function getMergeMethodColor(mergeMethod) {
-	switch(mergeMethod) {
-		case "automerge":
-			return "black"
-		case "initialSubmit":
-			return ""
-		case "merge_with_conflict":
-			return "red"
-		case "manual_merge":
-			return "darkgray"
-		case "populate":
-			return "blue"
-	}
-	return "UNKNOWN CASE: " + mergeMethod	
+	console.log("UNKNOWN CASE: " + mergeMethod)
+	return {color: "pink", style: "solid"}
 }
 
 function getStreamGraphName(streamDisplayName) {
 	if (streamDisplayName.endsWith("/Main")) {
 		return streamDisplayName
 	}
-	return streamDisplayName.split('/').reverse()[0]
+	const match = streamDisplayName.match(/\/\/[^\/]+\/([^\/]+).*/)
+	return match ? match[1] : streamDisplayName
 }
 
 async function getGitHubCommit(cl) {
@@ -73,14 +62,47 @@ async function generateChangeList(dataObj) {
 
 	const gitHubCommits = await getGitHubCommits(dataObj.changes)
 	let html = '<div style="margin: auto; width: 80%;"><table class="table"><tbody>'
-	for (const cl in dataObj.changes) {
-		console.log()
+	// By default the keys are going to be numerically ordered, but we want changes to appear after their parent
+	// So go through and build them in a list order we prefer
+	const orderedChanges = Object.keys(dataObj.changes).map(k => parseInt(k))
+	const placedChanges = new Set()
+	for (let i = 0; i < orderedChanges.length; i++) {
+		const sourceCL = dataObj.changes[orderedChanges[i].toString()].sourceCL
+		if (sourceCL && !placedChanges.has(sourceCL)) {
+			let insertPoint = undefined
+			for (let j = i+1; j < orderedChanges.length; j++) {
+				if (orderedChanges[j] == sourceCL) {
+					insertPoint = j
+				}
+				else if (insertPoint) {
+					// Keep the children with lower CL# of a given stream in numerical order
+					if (orderedChanges[j] < orderedChanges[i]) {
+						insertPoint = j
+					} else {
+						break
+					}
+				}
+			}
+			if (insertPoint) {
+				const removedKey = orderedChanges.splice(i, 1)[0]
+				orderedChanges.splice(insertPoint, 0, removedKey)
+				i--
+				continue
+			}
+		}
+		placedChanges.add(orderedChanges[i])
+	}
+	for (const cl of orderedChanges) {
+		const clKey = cl.toString()
+		const changeDetails = dataObj.changes[clKey]
 		html += '<tr valign="middle">'
-		html += `<td><b>${dataObj.changes[cl].streamDisplayName}</b></td>`
-		html += `<td><a href="https://p4-swarm.epicgames.net/changes/${cl}" target="_blank">CL#${cl}</a></td>`
-		html += `${formatGitHubCommit(gitHubCommits.get(cl))}`
-		//html += `<td style="text-align:center;">${getMergeMethodString(dataObj.changes[cl].mergeMethod)}</td>`
-		//html += `<td style="text-align:center;">${dataObj.changes[cl].sourceCL}</td>`
+		html += `<td><b>${changeDetails.streamDisplayName}</b></td>`
+		if (changeDetails.swarmLink) {
+			html += `<td><a href="${changeDetails.swarmLink}" target="_blank">CL#${cl}</a></td>`
+		} else {
+			html += `<td>CL#${cl}</td>`
+		}
+		html += `${formatGitHubCommit(gitHubCommits.get(clKey))}`
 		html += '</tr>'
 	}
 	html += "</tbody></table></div>"
@@ -96,23 +118,27 @@ function createGraph(changes) {
 		'node [shape=box, style=filled, fontname="sans-serif", fillcolor=moccasin];'
 	]
 	for (let change in changes) {
-		const attrs = [
-			['label', `<<b>${getStreamGraphName(changes[change].streamDisplayName)}</b><br/>${change}>`],
-			['tooltip', `"https://p4-swarm.epicgames.net/changes/${change}"`],
-			['URL', `"https://p4-swarm.epicgames.net/changes/${change}"`],
+		const changeDetails = changes[change]
+		let attrs = [
+			['label', `<<b>${getStreamGraphName(changeDetails.streamDisplayName)}</b><br/>${change}>`],
+			['tooltip', `"${changeDetails.swarmLink}"` || `"CL# ${change}"`],
 			['target', `"_blank"`],
 			['margin', `"0.5,0.1"`],
 			['fontsize', 15],
-		];
-		const attrStrs = attrs.map(([key, value]) => `${key}=${value}`);
-		lines.push(`_${change} [${attrStrs.join(', ')}];`);		
+		]
+		if (changeDetails.swarmLink) {
+			attrs.push(['URL', `"${changeDetails.swarmLink}"`])
+		}
+		const attrStrs = attrs.map(([key, value]) => `${key}=${value}`)
+		lines.push(`_${change} [${attrStrs.join(', ')}];`);	
 	}
 	for (let change in changes) {
 		if (changes[change].sourceCL in changes) {
 			if (changes[change].mergeMethod == "automerge") {
 				lines.push(`_${changes[change].sourceCL} -> _${change};`)
 			} else {
-				lines.push(`_${changes[change].sourceCL} -> _${change} [color=${getMergeMethodColor(changes[change].mergeMethod)}, style=dashed];`)
+				const mergeMethodStyle = getMergeMethodStyle(changes[change].mergeMethod)
+				lines.push(`_${changes[change].sourceCL} -> _${change} [color=${mergeMethodStyle.color}, style=${mergeMethodStyle.style}];`)
 			}
 		}
 	}
@@ -148,6 +174,9 @@ async function buildResults(data) {
 	} else {
 		const $errorPanel = $('#error-panel');
 		$('pre', $errorPanel).html('No results found.')
+		if (data.data.swarmURL) {
+			$('.swarmURL').html(`<a href="${data.data.swarmURL}/changes/${data.originalCL.cl}" target="_blank">CL# ${data.originalCL.cl}</a>`)
+		}
 		$errorPanel.show();
 	}
 	receivedTrackingResults()
